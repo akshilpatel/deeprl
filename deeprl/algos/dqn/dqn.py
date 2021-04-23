@@ -47,17 +47,18 @@ class DQN:
     def choose_action(self, state):
         if np.random.rand() < self.epsilon:
             action = self.env.action_space.sample()
+            # print('random_action')
         else:
             state = torch.tensor([state], dtype=torch.float, device=self.device)  # now passing through network, so should be float really
             
             self.q.eval()
             # convert to numpy so you can do random choice of max vals
-            q_vals = self.q(state).cpu().detach().numpy()  # (1, num_ac) do i need to detach given that i have already no_grad?
+            q_vals = self.q(state).cpu().detach().numpy().squeeze()  # (1, num_ac) do i need to detach given that i have already no_grad?
             self.q.train()
     
-            greedy_actions = np.where(q_vals == q_vals.max())[0] 
+            greedy_actions = np.where(q_vals == q_vals.max())[0]
             action = np.random.choice(greedy_actions)
-        
+            # print(q_vals, greedy_actions, action)
         assert self.env.action_space.contains(action)
         return action
                  
@@ -90,11 +91,11 @@ class DQN:
             q_targets = rewards + self.gamma * (1 - dones) * max_tgt_net_vals  # check
             
             assert q_preds.shape == q_targets.shape
-            print(q_preds.shape)
+            # print(q_preds.shape)
         
         # learn
         self.optimiser.zero_grad()
-        loss = self.criterion(q_preds, q_targets)  # maybe unsqueeze inputs here?
+        loss = self.criterion(q_preds, q_targets.detach())  # maybe unsqueeze inputs here?
         loss.backward()
         self.optimiser.step()
         
@@ -163,28 +164,35 @@ if __name__ == '__main__':
     env2 = gym.make('BipedalWalker-v3')
     input_dim = get_gym_space_shape(cartpole_env.observation_space)
     output_dim = get_gym_space_shape(cartpole_env.action_space)
-    net_layers = [(nn.Linear, {"in_features": input_dim, "out_features": 16}),
+    net_layers = [(nn.Linear, {"in_features": input_dim, "out_features": 32}),
                   (nn.ReLU, {}),
-                  (nn.Linear, {"in_features": 16, "out_features": 4}),
+                  (nn.Linear, {"in_features": 32, "out_features": 16}),
                   (nn.ReLU, {}),
-                  (nn.Linear, {"in_features": 4, "out_features": output_dim})]
+                  (nn.Linear, {"in_features": 16, "out_features": output_dim})]
 
     
-    dqn_args = {'gamma': 0.9,
-                'epsilon': 0.3,
-                'eps_decay_rate': 0.999,
+    dqn_args = {'gamma': 0.99,
+                'epsilon': 1.,
+                'eps_decay_rate': 0.95,
                 'env': cartpole_env,
                 'step_lim': 200,
                 'mb_size': 32,
                 'net_design': net_layers,
                 'optimiser': optim.Adam,
-                'lr': 0.0001,
+                'lr': 0.01,
                 'polyak_w': 1.,
-                'memory_max_len': 50000,
+                'memory_max_len': 10000,
                 'device': 'cpu', #torch.device('cuda' if torch.cuda.is_available() else 'cpu'),
                 'criterion': nn.MSELoss(),
-                'target_update_freq': 30            
+                'target_update_freq': 32            
                 }
     agent = DQN(dqn_args)
 
-    agent.train(10)
+    random.seed(1)
+    np.random.seed(1)
+    r = agent.train(200)
+    print(r)
+    plt.figure(figsize=(16,12))
+    plt.plot(r)
+    plt.show()
+    print(agent.epsilon)

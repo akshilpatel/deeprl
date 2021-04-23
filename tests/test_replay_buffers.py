@@ -2,10 +2,19 @@ import pytest
 import torch
 from torch import nn, optim
 import gym
+from collections import deque
 
-
-from deeplr.common.utils import get_gym_space_shape
+from deeprl.common.utils import get_gym_space_shape
 from deeprl.common.replay_buffers import Memory
+
+def test_memory_init():
+    m = Memory(100000, 'cpu')
+    assert type(m.buffer) == type(deque(1))
+    assert len(m.buffer) == 0
+    assert m.device == 'cpu' 
+
+def test
+    
 
 
 # TODO: finish this test

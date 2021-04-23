@@ -45,6 +45,5 @@ class Memory:
         
         return states, actions, rewards, dones, next_states
 
-
     def store(self, transition):
         self.buffer.append(transition)
