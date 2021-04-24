@@ -2,6 +2,7 @@ import torch
 from torch import nn
 from typing import List
 from abc import ABC
+from torch.distributions import Categorical, Normal
 
 class Network(nn.Module):
     def __init__(self, design: List):
@@ -14,7 +15,7 @@ class Network(nn.Module):
             self.layers.append(layer_type(**params))
 
         self.net = nn.Sequential(*self.layers)
-
+        
     def forward(self, x):
         assert type(x) == torch.Tensor
         assert x.dim() > 1
@@ -31,3 +32,30 @@ class Agent(ABC):
 
     def train(self, num_epi, render=False):
         pass
+
+
+# TODO: add action scaling
+class CategoricalPolicy(Network):
+    def __init__(self, arch):
+        super().__init__(arch['net_design'])
+    
+    def sample(self, state):
+        logits = self.forward(state) # gives log logits right?
+        prob_dist = Categorical(logits=logits) # use logits if unnormalised, 
+        action = prob_dist.sample()
+        log_prob = prob_dist.log_prob(action)
+
+        return action, log_prob
+
+# TODO: add action scaling
+class GaussianPolicy(Network):
+    def __init__(self, arch):
+        super().__init__(arch['net_design'])
+    
+    def sample(self, state):
+        mu, sigma = self.forward(state) 
+        prob_dist = Normal(mu, sigma) 
+        action = prob_dist.sample()
+        log_prob = prob_dist.log_prob(action)
+
+        return action, log_prob

@@ -16,6 +16,7 @@ import random
 from deeprl.common.utils import get_gym_space_shape
 from deeprl.common.base import Network
 from deeprl.common.replay_buffers import Memory
+import multiprocessing as mp
 
 
 class DQN:
@@ -81,22 +82,21 @@ class DQN:
             assert nxt_tgt_net_vals.shape == (self.mb_size, 2)
             
             # Get the max over columns and take only the values - not indices
-            max_tgt_net_vals = torch.max(nxt_tgt_net_vals, dim=1)[0]  # shape: (m_batch, 1)
-#             max_tgt_net_vals.unsqueeze_(-1)
+            max_tgt_net_vals = torch.max(nxt_tgt_net_vals, dim=1)[0]  # shape: (m_batch,)
             
-            assert max_tgt_net_vals.shape == (self.mb_size,), max_tgt_net_vals.shape  # does this shape work for subtraction/addition?
+            assert max_tgt_net_vals.shape == (self.mb_size,), max_tgt_net_vals.shape  
             assert max_tgt_net_vals.shape == rewards.shape, rewards.shape
             assert max_tgt_net_vals.shape == dones.shape, dones.shape
             
             q_targets = rewards + self.gamma * (1 - dones) * max_tgt_net_vals  # check
             
             assert q_preds.shape == q_targets.shape
-            # print(q_preds.shape)
         
         # learn
         self.optimiser.zero_grad()
-        loss = self.criterion(q_preds, q_targets.detach())  # maybe unsqueeze inputs here?
+        loss = self.criterion(q_preds, q_targets)  
         loss.backward()
+        nn.utils.clip_grad_norm_(self.q.parameters(), 1., -1.)
         self.optimiser.step()
         
         return True
@@ -173,26 +173,32 @@ if __name__ == '__main__':
     
     dqn_args = {'gamma': 0.99,
                 'epsilon': 1.,
-                'eps_decay_rate': 0.95,
+                'eps_decay_rate': 0.999,
                 'env': cartpole_env,
                 'step_lim': 200,
-                'mb_size': 32,
+                'mb_size': 64,
                 'net_design': net_layers,
                 'optimiser': optim.Adam,
-                'lr': 0.01,
+                'lr': 0.001,
                 'polyak_w': 1.,
-                'memory_max_len': 10000,
+                'memory_max_len': 10000000,
                 'device': 'cpu', #torch.device('cuda' if torch.cuda.is_available() else 'cpu'),
                 'criterion': nn.MSELoss(),
-                'target_update_freq': 32            
+                'target_update_freq': 64     
                 }
     agent = DQN(dqn_args)
 
-    random.seed(1)
-    np.random.seed(1)
-    r = agent.train(200)
-    print(r)
+    num_agents = 30
+    r = []
+    for i in range(num_agents):
+        print(i)
+        random.seed(i)
+        np.random.seed(i)
+        agent = DQN(dqn_args)
+        r.append(agent.train(300))
+
+    out = np.array(r).mean(0)
+    
     plt.figure(figsize=(16,12))
-    plt.plot(r)
+    plt.plot(out)
     plt.show()
-    print(agent.epsilon)
