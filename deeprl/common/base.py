@@ -37,7 +37,7 @@ class Agent(ABC):
 # TODO: add action scaling
 class CategoricalPolicy(Network):
     def __init__(self, arch):
-        super().__init__(arch['net_design'])
+        super().__init__(arch)
     
     def sample(self, state):
         logits = self.forward(state) # gives log logits right?

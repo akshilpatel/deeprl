@@ -18,18 +18,18 @@ from deeprl.common.base import Network
 from deeprl.common.replay_buffers import Memory
 import multiprocessing as mp
 from torch.distributions import Categorical, Normal
+from deeprl.common.base import CategoricalPolicy, GaussianPolicy
 
 
-
-class vpg:
+class VPG:
     def __init__(self, params):
         self.device = params['device']
         self.gamma = params['gamma']
-        self.lr = params['lr']        
+        self.lr = params['policy_optimiser_lr']        
         self.env = params['env']
-        self.policy = Network(params['policy_layers'])
+        self.policy = CategoricalPolicy(params['policy_layers'])
         self.policy.to(self.device)
-        self.optimiser = params['optimiser'](self.policy.parameters(), self.lr)
+        self.optimiser = params['policy_optimiser'](self.policy.parameters(), self.lr)
         
 
     #policy net ends with a  softmax
@@ -58,8 +58,6 @@ class vpg:
             if done:
                 break
         
-            
-        log_prob_track = torch.stack(log_prob_track)
         self.update((reward_track, log_prob_track))
 
         return total_reward
@@ -67,16 +65,18 @@ class vpg:
     def update(self, experience):
         # Unpack experience and make sure they are all torch tensors
         rewards, log_probs = experience
+        log_probs = torch.stack(log_probs).to(self.device)
+        rewards = torch.tensor(rewards, device=self.device).unsqueeze(-1)
+        
         # With no grad: compute gt ()
         gt_vec = self._compute_gt(rewards)
         
-        assert log_probs.shape == gt_vec.shape
-        
+        assert log_probs.shape == gt_vec.shape, (log_probs.shape, gt_vec.shape)
         
         
         self.optimiser.zero_grad()
-        loss = - torch.reduce_sum(log_probs * gt_vec)
-        loss.backwards()
+        loss = -torch.sum(log_probs * gt_vec)
+        loss.backward()
         nn.utils.clip_grad_norm_(self.policy.parameters(), 1., -1.)
         self.optimiser.step()
         
@@ -88,7 +88,14 @@ class vpg:
 
     @torch.no_grad()
     def _compute_gt(self, rewards):
-        pass
+        # iterate backwards and add self.gamma * 
+        g = 0
+        g_vec = torch.zeros_like(rewards)
+        for i, r in enumerate(reversed(rewards)):
+            g *= self.gamma 
+            g += r
+            g_vec[i] = g
+        return g_vec
 
     def train(self, num_epi, render=False):
         rewards = [self.run_episode(render) for _ in range(num_epi)]
@@ -103,26 +110,25 @@ if __name__ == '__main__':
     cartpole_env = gym.make('CartPole-v1')
     input_dim = get_gym_space_shape(cartpole_env.observation_space)
     output_dim = get_gym_space_shape(cartpole_env.action_space)
-    policy_layers = [(nn.Linear, {"in_features": input_dim, "out_features": 32}),
+    policy_layers = [(nn.Linear, {"in_features": input_dim, "out_features": 64}),
                   (nn.ReLU, {}),
-                  (nn.Linear, {"in_features": 32, "out_features": 16}),
+                  (nn.Linear, {"in_features": 64, "out_features": 32}),
                   (nn.ReLU, {}),
-                  (nn.Linear, {"in_features": 16, "out_features": output_dim})]
+                  (nn.Linear, {"in_features": 32, "out_features": output_dim})]
 
     
     vpg_args = {'gamma': 0.99,
-                'epsilon': 1.,
-                'eps_decay_rate': 0.999,
                 'env': cartpole_env,
                 'step_lim': 200,
-                'policy_design': policy_layers,
+                'policy_layers': policy_layers,
                 'policy_optimiser': optim.Adam,
                 'policy_optimiser_lr': 0.001,
                 'device': 'cpu', #torch.device('cuda' if torch.cuda.is_available() else 'cpu'), 
                 }
     agent = VPG(vpg_args)
 
-    num_agents = 30
+    num_agents = 10
+    num_epi = 100
     r = []
 
     # run experiment
@@ -131,8 +137,7 @@ if __name__ == '__main__':
         random.seed(i)
         np.random.seed(i)
         agent = VPG(vpg_args)
-        r.append(agent.train(200))
-
+        r.append(agent.train(num_epi))
     out = np.array(r).mean(0)
     plt.figure(figsize=(16,12))
     plt.plot(out)
