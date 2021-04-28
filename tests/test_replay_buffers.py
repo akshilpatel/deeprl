@@ -9,12 +9,9 @@ from deeprl.common.replay_buffers import Memory
 
 def test_memory_init():
     m = Memory(100000, 'cpu')
-    assert type(m.buffer) == type(deque(1))
+    assert type(m.buffer) == type(deque([1]))
     assert len(m.buffer) == 0
-    assert m.device == 'cpu' 
-
-def test
-    
+    assert m.device == 'cpu'     
 
 
 # TODO: finish this test

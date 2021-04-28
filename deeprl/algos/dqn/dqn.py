@@ -95,6 +95,7 @@ class DQN:
         # learn
         self.optimiser.zero_grad()
         loss = self.criterion(q_preds, q_targets)  
+        assert loss.shape == ()
         loss.backward()
         nn.utils.clip_grad_norm_(self.q.parameters(), 1., -1.)
         self.optimiser.step()
@@ -188,14 +189,14 @@ if __name__ == '__main__':
                 }
     agent = DQN(dqn_args)
 
-    num_agents = 30
+    num_agents = 1
     r = []
     for i in range(num_agents):
         print(i)
         random.seed(i)
         np.random.seed(i)
         agent = DQN(dqn_args)
-        r.append(agent.train(300))
+        r.append(agent.train(100))
 
     out = np.array(r).mean(0)
     
