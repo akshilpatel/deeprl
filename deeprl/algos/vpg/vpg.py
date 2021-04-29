@@ -135,7 +135,7 @@ class VPG:
         """
         assert type(rewards) == torch.Tensor, rewards
         assert rewards.dtype in [torch.float, torch.float32, torch.float64]
-        assert rewards.device == torch.device(self.device)
+        
         # assert rewards.dim() == 2
 
         # iterate backwards and add self.gamma * r
@@ -215,11 +215,11 @@ if __name__ == '__main__':
                 'policy_layers': policy_layers,
                 'policy_optimiser': optim.Adam,
                 'policy_optimiser_lr': 0.001,
-                'device': 'cpu', #torch.device('cuda' if torch.cuda.is_available() else 'cpu'), 
+                'device': 'cuda' if torch.cuda.is_available() else 'cpu', 
                 'entropy_coef' : 0.015
                 }
 
-    num_agents = 30
+    num_agents = 5
     num_epi = 300
     r = []
     losses = []
@@ -251,7 +251,7 @@ if __name__ == '__main__':
     # plt.plot(loss_out, label='loss')
     # plt.plot(gt_out, label='gts')
     plt.legend()
-    plt.savefig('./data/vpg_cartpole.PNG')
+    # plt.savefig('./data/vpg_cartpole.PNG')
     plt.show()
     
     
