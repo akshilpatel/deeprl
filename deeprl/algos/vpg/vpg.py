@@ -15,8 +15,6 @@ import random
 
 from deeprl.common.utils import get_gym_space_shape
 from deeprl.common.base import Network
-from deeprl.common.replay_buffers import Memory
-import multiprocessing as mp
 from torch.distributions import Categorical, Normal
 from deeprl.common.base import CategoricalPolicy, GaussianPolicy
 
@@ -52,7 +50,8 @@ class VPG:
         state = torch.tensor([state], dtype=torch.float, device=self.device)
         action, log_prob, entropy = self.policy.sample(state) # tensors of shape [1, action_dim]
         
-        action = action.cpu().squeeze().detach().numpy() # tensor of shape (action_dim,)
+        # Convert back to numpy array for gym and use squeeze to deal with discrete actions
+        action = action.cpu().squeeze().detach().numpy()
         
         assert self.env.action_space.contains(action), action
 
@@ -117,6 +116,7 @@ class VPG:
         # Update
         self.optimiser.zero_grad()
         loss.backward()
+        nn.utils.clip_grad_norm_(self.policy.parameters(), 1.)
         self.optimiser.step()
         # print(loss)
         return True
@@ -196,7 +196,7 @@ class VPG:
 if __name__ == '__main__':
     
     # setup params
-    env = gym.make('CartPole-v1')
+    env = gym.make('MountainCar-v0')
     input_dim = get_gym_space_shape(env.observation_space)
     output_dim = get_gym_space_shape(env.action_space)
     print(input_dim, output_dim)

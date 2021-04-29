@@ -97,7 +97,7 @@ class DQN:
         loss = self.criterion(q_preds, q_targets)  
         assert loss.shape == ()
         loss.backward()
-        nn.utils.clip_grad_norm_(self.q.parameters(), 1., -1.)
+        nn.utils.clip_grad_norm_(self.q.parameters(), 1.)
         self.optimiser.step()
         
         return True

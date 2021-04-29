@@ -33,7 +33,6 @@ class CategoricalPolicy(Network):
     def sample(self, state):
         params = self.forward(state) # gives unnormalised logits
         assert type(params) == torch.Tensor
-        assert params.shape == torch.Size([1, 2])
         assert torch.is_floating_point(params)
 
         prob_dist = Categorical(logits=params) # use logits if unnormalised,       
@@ -54,8 +53,16 @@ class GaussianPolicy(Network):
     
     def sample(self, state):
         mu, log_std = self.forward(state) 
+        assert type(mu) == torch.Tensor
+        assert torch.is_floating_point(mu)
+        assert type(log_std) == torch.Tensor
+        assert torch.is_floating_point(log_std)
+        
         prob_dist = Normal(mu, torch.exp(log_std)**2)
-        action = prob_dist.rsample() # rsample to make sure gradient flows through dist
-        log_prob = prob_dist.log_prob(action)
 
-        return action, log_prob
+        action = prob_dist.rsample() # rsample to make sure gradient flows through dist
+        
+        log_prob = prob_dist.log_prob(action)
+        entropy = prob_dist.entropy()
+        
+        return action, log_prob, entropy
