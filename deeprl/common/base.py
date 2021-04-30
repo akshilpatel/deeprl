@@ -2,9 +2,10 @@ import torch
 from torch import nn
 from typing import List
 from abc import ABC
-from torch.distributions import Categorical, Normal
+from torch.distributions import Categorical, Normal, MultivariateNormal
 import numpy as np
-
+from deeprl.common.utils import get_gym_space_shape
+import torch.nn.functional as F
 
 class Network(nn.Module):
     def __init__(self, design: List):
@@ -27,7 +28,7 @@ class Network(nn.Module):
 
 # TODO: check gradients computed through here properly
 class CategoricalPolicy(Network):
-    def __init__(self, arch):
+    def __init__(self, arch, action_space):
         super().__init__(arch)
     
     def sample(self, state):
@@ -38,31 +39,53 @@ class CategoricalPolicy(Network):
         prob_dist = Categorical(logits=params) # use logits if unnormalised,       
         
         action = prob_dist.sample()        
-        
         log_prob = prob_dist.log_prob(action)
-
         entropy = prob_dist.entropy()
-
+        
         return action, log_prob, entropy
 
 
 # TODO: Add action scaling
 class GaussianPolicy(Network):
-    def __init__(self, arch):
-        super().__init__(arch['net_design'])
-    
-    def sample(self, state):
-        mu, log_std = self.forward(state) 
-        assert type(mu) == torch.Tensor
-        assert torch.is_floating_point(mu)
-        assert type(log_std) == torch.Tensor
-        assert torch.is_floating_point(log_std)
+    def __init__(self, arch, action_space):
+        super().__init__(arch)
         
-        prob_dist = Normal(mu, torch.exp(log_std)**2)
+        self.action_dim = get_gym_space_shape(action_space)
+        hidden_dim = arch[-2][1]['out_features']
+        self.mu_fc = nn.Linear(hidden_dim, self.action_dim)
+        self.cov_fc = nn.Linear(hidden_dim, self.action_dim)
 
-        action = prob_dist.rsample() # rsample to make sure gradient flows through dist
+        self.dist = MultivariateNormal
+        self.action_space = action_space
+        self.action_low = action_space.low
+        self.action_high = action_space.high
+        self.action_scale = self.action_high - self.action_low
+        self.action_mid = (self.action_high + self.action_low)/2.
+
+    def forward(self, x):
+        h_out = super().forward(x)
+
+        mu = torch.tanh(self.mu_fc(h_out))
+        log_cov = F.softplus(self.cov_fc(h_out))
+        cov = torch.exp(log_cov) ** 2
+
+        assert mu.shape == (1, self.action_dim)
+        assert cov.shape == (1, self.action_dim)
+        assert torch.all(cov >= 0)
+
+        return mu, cov
+
+    # TODO: fix this so it works with MultiNormal
+    def sample(self, state):
+        params = self.forward(state)
+        prob_dist = self.dist(*params)
         
+        action = prob_dist.rsample() # rsample to make sure gradient flows through dist
+
+        action = torch.clamp((action * self.action_scale) + self.action_mean, self.action_low, self.action_max)
+
         log_prob = prob_dist.log_prob(action)
         entropy = prob_dist.entropy()
         
         return action, log_prob, entropy
+
