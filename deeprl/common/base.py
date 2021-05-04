@@ -75,7 +75,7 @@ class GaussianPolicy(Network):
 
         return mu, cov
 
-    # TODO: fix this so it works with MultiNormal
+    # TODO: fix this so it works with MultiNormalz
     def sample(self, state):
         params = self.forward(state)
         prob_dist = self.dist(*params)
