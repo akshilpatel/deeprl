@@ -28,22 +28,23 @@ class Network(nn.Module):
 
 # TODO: check gradients computed through here properly
 class CategoricalPolicy(Network):
-    def __init__(self, arch, action_space):
+    def __init__(self, arch):
         super().__init__(arch)
     
-    def sample(self, state):
+    def sample(self, state, action=None):
         params = self.forward(state) # gives unnormalised logits
         assert type(params) == torch.Tensor
         assert torch.is_floating_point(params)
 
         prob_dist = Categorical(logits=params) # use logits if unnormalised,       
         
-        action = prob_dist.sample()        
+        if action==None:
+            action = prob_dist.sample()
+
         log_prob = prob_dist.log_prob(action)
         entropy = prob_dist.entropy()
-        
-        return action, log_prob, entropy
 
+        return action, log_prob, entropy
 
 # TODO: Add action scaling
 class GaussianPolicy(Network):
@@ -76,12 +77,13 @@ class GaussianPolicy(Network):
         return mu, cov
 
     # TODO: fix this so it works with MultiNormalz
-    def sample(self, state):
+    def sample(self, state, action=None):
         params = self.forward(state)
         prob_dist = self.dist(*params)
         
-        action = prob_dist.rsample() # rsample to make sure gradient flows through dist
-
+        if action==None:
+            action = prob_dist.rsample() # rsample to make sure gradient flows through dist
+        
         action = torch.clamp((action * self.action_scale) + self.action_mean, self.action_low, self.action_max)
 
         log_prob = prob_dist.log_prob(action)
