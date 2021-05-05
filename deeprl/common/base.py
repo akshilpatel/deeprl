@@ -7,6 +7,9 @@ import numpy as np
 from deeprl.common.utils import get_gym_space_shape
 import torch.nn.functional as F
 
+#TODO: Add squeezing for log_probs and entropies and make that work for code base
+
+
 class Network(nn.Module):
     def __init__(self, design: List):
         super().__init__()
@@ -26,7 +29,10 @@ class Network(nn.Module):
         out = self.net(x)
         return out
 
-# TODO: check gradients computed through here properly
+# TODO: change this to take a network as argument and call the net to get params,
+#  and include methods for choosing an action, getting log_probs, entropies, params, and having a dist as an attribute 
+# Policy classes have a network, distribution type and chosoe_action method, and getters for log_prob and entropy and params
+# Updates happen to policies by agents which have policies ==> update is in the agent class
 class CategoricalPolicy(Network):
     def __init__(self, arch):
         super().__init__(arch)
@@ -38,13 +44,14 @@ class CategoricalPolicy(Network):
 
         prob_dist = Categorical(logits=params) # use logits if unnormalised,       
         
-        if action==None:
+        if action is None:
             action = prob_dist.sample()
-
+        
         log_prob = prob_dist.log_prob(action)
         entropy = prob_dist.entropy()
 
         return action, log_prob, entropy
+    
 
 # TODO: Add action scaling
 class GaussianPolicy(Network):
@@ -81,9 +88,9 @@ class GaussianPolicy(Network):
         params = self.forward(state)
         prob_dist = self.dist(*params)
         
-        if action==None:
+        if action is None:
             action = prob_dist.rsample() # rsample to make sure gradient flows through dist
-        
+
         action = torch.clamp((action * self.action_scale) + self.action_mean, self.action_low, self.action_max)
 
         log_prob = prob_dist.log_prob(action)
