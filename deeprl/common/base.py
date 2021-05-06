@@ -4,7 +4,7 @@ from typing import List
 from abc import ABC
 from torch.distributions import Categorical, Normal, MultivariateNormal
 import numpy as np
-from deeprl.common.utils import get_gym_space_shape
+from deeprl.common.utils import get_gym_space_shape, net_gym_space_dims
 import torch.nn.functional as F
 
 #TODO: Add squeezing for log_probs and entropies and make that work for code base
@@ -47,8 +47,6 @@ class CategoricalPolicy(Network):
         if action is None:
             action = prob_dist.sample()
         
-        print(action.shape)
-        
         log_prob = prob_dist.log_prob(action)
         entropy = prob_dist.entropy()
 
@@ -60,7 +58,7 @@ class GaussianPolicy(Network):
     def __init__(self, arch, action_space):
         super().__init__(arch)
         
-        self.action_dim = get_gym_space_shape(action_space)
+        self.action_dim = net_gym_space_dims(action_space)
         hidden_dim = arch[-2][1]['out_features']
         self.mu_fc = nn.Linear(hidden_dim, self.action_dim)
         self.cov_fc = nn.Linear(hidden_dim, self.action_dim)

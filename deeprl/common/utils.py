@@ -14,7 +14,7 @@ def get_gym_space_shape(space):
     if isinstance(space, Box):
         return space.shape
     elif isinstance(space, Discrete):
-        return (space.n,)
+        return (1,)
     else:
         raise TypeError("You haven't input a valid gym space. Here is your input: {}".format(space))
 

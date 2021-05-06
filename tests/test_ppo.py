@@ -17,7 +17,7 @@ from torch.distributions import Categorical, Normal
 
 import random
 
-from deeprl.common.utils import net_gym_space_dims, discount_cumsum
+from deeprl.common.utils import net_gym_space_dims, discount_cumsum, get_gym_space_shape
 from deeprl.common.base import Network, CategoricalPolicy, GaussianPolicy
 from deeprl.algos.ppo.ppo import PPO
 
@@ -32,6 +32,7 @@ def test_choose_action():
         env = gym.make(env_name)
         state_dim = net_gym_space_dims(env.observation_space)
         action_dim = net_gym_space_dims(env.action_space)
+        print(state_dim, action_dim)
         policy_layers = [
                         (nn.Linear, {'in_features': state_dim, 'out_features': 128}),
                         (nn.ReLU, {}),
@@ -178,12 +179,6 @@ def test_compute_lp_and_ent():
 
 # Requirement: Agent stores transitions in the buffer correctly and outputs the correct episodic rewards
 def test_generate_experience():
-    # Check log_probs don't have grads
-    # check everything is the right shape and size
-    # check all the states and actions are in the env
-    # Check the size is batch_size
-    # Check dtypes/types 
-
     envs = ['CartPole-v1', 'Pendulum-v0', 'LunarLanderContinuous-v2']
     batch_sizes = [10, 100, 512]
     for env_name in envs: 
@@ -234,23 +229,37 @@ def test_generate_experience():
             epi_rewards = agent.generate_experience()
             assert len(agent.buffer) == agent.batch_size, len(agent.buffer)
 
-            to_torch = lambda x: torch.from_numpy(np.stack(x)).float().to(agent.device)
-            
+            to_torch = lambda x: torch.tensor(x).float().to(agent.device).squeeze()
             buffer_data = zip(*agent.buffer)
-            # print(list(buffer_data)[1])
-            
-            states, actions, log_probs, rewards, dones, next_states = tuple(buffer_data)
-            print(states[0].shape)
-            states = to_torch(states)
-            actions = to_torch(actions)
-            log_probs = to_torch(log_probs)
-            rewards = to_torch(log_probs)
-            dones = to_torch(dones)
-            next_states = to_torch
+            states, actions, log_probs, rewards, dones, next_states = tuple(map(to_torch, buffer_data))
 
-            print(states.shape, actions.shape, log_probs.shape, rewards.shape, dones.shape, next_states.shape)
 
             ### TESTING ###
+
+            # check everything is the right shape and size
+            assert len(states) == agent.batch_size
+            assert len(actions) == agent.batch_size
+            assert log_probs.shape == (agent.batch_size,)
+            assert rewards.shape == (agent.batch_size,)
+            assert dones.shape == (agent.batch_size,)
+            assert next_states.shape == states.shape
+
+            assert states.device == torch.device(agent.device)
+            assert rewards.device == torch.device(agent.device)
+            assert dones.device == torch.device(agent.device)
+
+            assert torch.is_floating_point(states)
+            assert torch.is_floating_point(actions)
+            assert torch.is_floating_point(rewards)
+            assert torch.is_floating_point(dones)
+            assert torch.is_floating_point(next_states)
+
+            for i in range(len(states)):
+                assert agent.env.observation_space.contains(states[i].cpu().detach().numpy()), states[i].cpu().detach().numpy()
+                assert agent.env.observation_space.contains(next_states[i].cpu().detach().numpy()), next_states[i].cpu().detach().numpy()
+
+
+
 
 
 
