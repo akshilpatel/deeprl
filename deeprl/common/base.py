@@ -65,8 +65,8 @@ class GaussianPolicy(Network):
 
         self.dist = MultivariateNormal
         self.action_space = action_space
-        self.action_low = action_space.low
-        self.action_high = action_space.high
+        self.action_low = torch.from_numpy(action_space.low)
+        self.action_high = torch.from_numpy(action_space.high)
         self.action_scale = self.action_high - self.action_low
         self.action_mid = (self.action_high + self.action_low)/2.
 
@@ -85,14 +85,19 @@ class GaussianPolicy(Network):
 
     # TODO: fix this so it works with MultiNormalz
     def sample(self, state, action=None):
-        params = self.forward(state)
-        prob_dist = self.dist(*params)
+        mu, cov = self.forward(state)
+        
+        prob_dist = self.dist(mu, torch.diag(cov.squeeze(0)))
+        
         
         if action is None:
             action = prob_dist.rsample() # rsample to make sure gradient flows through dist
 
-        action = torch.clamp((action * self.action_scale) + self.action_mean, self.action_low, self.action_max)
-
+        
+        action = action * self.action_scale.expand_as(action) + self.action_mid.expand_as(action)
+        action = torch.max(torch.min(action, self.action_high), self.action_low)
+        
+        
         log_prob = prob_dist.log_prob(action)
         entropy = prob_dist.entropy()
         

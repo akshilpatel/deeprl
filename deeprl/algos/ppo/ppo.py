@@ -27,8 +27,8 @@ class PPO:
         self.env = params['env']
         self.batch_size = params['batch_size']
         self.mb_size = params['mb_size']
-        self.num_update_iter = params['num_update_iter']
-        self.clip = params['clip']
+        self.num_train_passes = params['num_train_passes']
+        self.pi_loss_clip = params['pi_loss_clip']
         self.lam = params['lam']
         self.entropy_coef = params['entropy_coef']
 
@@ -40,7 +40,6 @@ class PPO:
 
         # Policy
         self.policy = params['policy'].to(self.device)
-        print(self.policy)
         self.policy_lr = params['policy_lr'] 
         self.policy_optimiser = params['policy_optimiser'](self.policy.parameters(), self.policy_lr)
         
@@ -53,6 +52,7 @@ class PPO:
             # interact with env and store (state, action, lp_old, reward, done, next_states)
             # increment current step and 
             # log everything as well.
+        # What do I do for logging rewards when the agent does not complete the episode?
 
             
         
@@ -167,34 +167,52 @@ class PPO:
         # clear optim, call backward, clip grads, take a step
 
     def train(self, num_epochs, render=False):
+        """Interface function which is used to run the agent's learning
+
+        Args:
+            num_epochs (int): Number of times to iterate through the process of generating and learning
+            render (bool, optional): Whether or not to render the agents interactions when generating experience. Used for debugging mostly. Defaults to False. 
+
+        Returns:
+            numpy.ndarray : array containing episodic rewards
+        """
         # for each epoch
         # call generate - log rewards
         # call update
         # clear buffer
+        
+        for i_epoch in range(num_epochs):
+            print('Starting Epoch {}'.format(i_epoch))
+            self.generate_experience()
+            self.update()
+            self.clear_buffer()
         return episodic_reward
     
     def choose_action(self, state):
-        """Calls the policy network to sample an action for a given state. The log_prob of the action and the entropy of the distribution are also recorded for updates.
-
+        """Calls the policy network to sample an action, corresponding log_prob and entropy for a given state. 
+        
         Args:
             state (numpy array): current state of the environment
 
         Returns:
             action (numpy array, (gym action_dim))
-            torch float tensor (1, 1): log probability of policy distribution used to sample the action
-            torch float tensor (1, 1): entropy of policy distribution used to sample the action
+            torch float tensor (1,): log probability of policy distribution used to sample the action, gradients:True
+            torch float tensor (1,): entropy of policy distribution used to sample the action, gradients:True
         """
         # defensive programming inputs
         assert self.env.observation_space.contains(state), state
 
-        state = torch.tensor([state], dtype=torch.float, device=self.device)
+        # unsqueeze to make it a batch of size 1
+        state = torch.tensor(state, dtype=torch.float, device=self.device).unsqueeze(0)
+        
         action, log_prob, entropy = self.policy.sample(state)
+        # print(action)
 
         # Convert to gym action and squeeze to deal with discrete action spaces
-        action = action.cpu().detach().numpy().squeeze()
+        action = action.cpu().detach().numpy().squeeze(0)
 
         # defensive programming outputs
-        assert self.env.action_space.contains(action), action
+        assert self.env.action_space.contains(action), (action, action.shape, action.dtype, self.env.action_space)
         assert log_prob.shape == (1,), log_prob
         assert entropy.shape == (1,), entropy
 
@@ -227,7 +245,7 @@ if __name__ == '__main__':
                     ]
 
     
-    a2c_args = {'gamma': 0.99,
+    ppo_args = {'gamma': 0.99,
                 'env': env,
                 'step_lim': 200,
                 'policy': GaussianPolicy(policy_layers, env.action_space),
@@ -242,27 +260,27 @@ if __name__ == '__main__':
                 }
         
     
-    # run experiment
-    for i in range(num_agents):
-        print("Running training for agent number {}".format(i))
-        agent = PPO(ppo_args)
+    # # run experiment
+    # for i in range(num_agents):
+    #     print("Running training for agent number {}".format(i))
+    #     agent = PPO(ppo_args)
         
-        # random.seed(i)
-        # np.random.seed(i)
-        # torch.manual_seed(i)
-        # env.seed(i)
+    #     # random.seed(i)
+    #     # np.random.seed(i)
+    #     # torch.manual_seed(i)
+    #     # env.seed(i)
         
-        r.append(agent.train(num_epi))
+    #     r.append(agent.train(num_epi))
 
-    out = np.array(r).mean(0)
+    # out = np.array(r).mean(0)
 
-    plt.figure(figsize=(5, 3))
-    plt.title('PPO on cartpole')
-    plt.xlabel('Episode')
-    plt.ylabel('Episodic Reward')
-    plt.plot(out, label='rewards')
-    plt.legend()
+    # plt.figure(figsize=(5, 3))
+    # plt.title('PPO on cartpole')
+    # plt.xlabel('Episode')
+    # plt.ylabel('Episodic Reward')
+    # plt.plot(out, label='rewards')
+    # plt.legend()
 
-    # plt.savefig('./data/ppo_cartpole.PNG')
-    plt.show()
+    # # plt.savefig('./data/ppo_cartpole.PNG')
+    # plt.show()
     
