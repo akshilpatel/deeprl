@@ -66,10 +66,12 @@ class OnPolicyMemory(Memory):
         self.max_len = max_len
         self.device = device
         self.buffer = deque(maxlen=self.max_len)
-    
-    def sample(self):
-        out = tuple(map(self.to_torch, zip(*self.buffer)))
-        return out
 
-    def compute_adv_and_returns(self, rewards, dones):
-        pass
+    def sample(self):
+        out = tuple(zip(*self.buffer)))
+        return out
+    
+    def reset(self):
+        self.buffer.clear()
+
+

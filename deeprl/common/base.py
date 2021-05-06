@@ -47,6 +47,8 @@ class CategoricalPolicy(Network):
         if action is None:
             action = prob_dist.sample()
         
+        print(action.shape)
+        
         log_prob = prob_dist.log_prob(action)
         entropy = prob_dist.entropy()
 
@@ -76,9 +78,11 @@ class GaussianPolicy(Network):
         mu = torch.tanh(self.mu_fc(h_out))
         log_cov = F.softplus(self.cov_fc(h_out))
         cov = torch.exp(log_cov) ** 2
+        # turn into square covariance matrix
+        cov = torch.diag(cov.squeeze(0))
 
         assert mu.shape == (1, self.action_dim)
-        assert cov.shape == (1, self.action_dim)
+        assert cov.shape == (self.action_dim, self.action_dim)
         assert torch.all(cov >= 0)
 
         return mu, cov
@@ -86,8 +90,9 @@ class GaussianPolicy(Network):
     # TODO: fix this so it works with MultiNormalz
     def sample(self, state, action=None):
         mu, cov = self.forward(state)
-        
-        prob_dist = self.dist(mu, torch.diag(cov.squeeze(0)))
+
+        # turn into covariance matrix
+        prob_dist = self.dist(mu, cov)
         
         
         if action is None:
@@ -95,11 +100,10 @@ class GaussianPolicy(Network):
 
         
         action = action * self.action_scale.expand_as(action) + self.action_mid.expand_as(action)
+        # Same as clamp but with vector max and min - used to make sure action is within action_space
         action = torch.max(torch.min(action, self.action_high), self.action_low)
-        
         
         log_prob = prob_dist.log_prob(action)
         entropy = prob_dist.entropy()
         
         return action, log_prob, entropy
-

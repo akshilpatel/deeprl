@@ -13,7 +13,7 @@ from typing import List, Tuple, Dict
 
 import random
 
-from deeprl.common.utils import get_gym_space_shape
+from deeprl.common.utils import net_gym_space_dims
 from deeprl.common.base import Network
 from torch.distributions import Categorical, Normal
 from deeprl.common.base import CategoricalPolicy, GaussianPolicy
@@ -197,8 +197,8 @@ if __name__ == '__main__':
     
     # setup params
     env = gym.make('MountainCar-v0')
-    input_dim = get_gym_space_shape(env.observation_space)
-    output_dim = get_gym_space_shape(env.action_space)
+    input_dim = net_gym_space_dims(env.observation_space)
+    output_dim = net_gym_space_dims(env.action_space)
     print(input_dim, output_dim)
     policy_layers = [
                     (nn.Linear, {"in_features": input_dim, "out_features": 64}),

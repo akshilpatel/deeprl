@@ -25,12 +25,14 @@ class PPO:
         self.device = params['device']
         self.gamma = params['gamma']       
         self.env = params['env']
+        self.action_dim = get_gym_space_shape(self.env.action_space)
         self.batch_size = params['batch_size']
         self.mb_size = params['mb_size']
         self.num_train_passes = params['num_train_passes']
         self.pi_loss_clip = params['pi_loss_clip']
         self.lam = params['lam']
         self.entropy_coef = params['entropy_coef']
+        
 
         # Critic
         self.critic = params['critic'].to(self.device)
@@ -45,19 +47,55 @@ class PPO:
         
         self.buffer = deque(maxlen=self.batch_size)     
         
-    def generate_experience(self, render=False):
-        # initialise vars and set done
-        # while the current step isn't less than limit
-            # if done: reset env and vars
-            # interact with env and store (state, action, lp_old, reward, done, next_states)
-            # increment current step and 
-            # log everything as well.
-        # What do I do for logging rewards when the agent does not complete the episode?
 
+    # TODO: Add logging
+    # TODO: Currently this resets env even if the last call of generate_experience didn't terminate the episode - fix this
+    def generate_experience(self, render=False):
+        """Interact with environment to produce rollout over multiple episodes if necessary.
+
+        Simulates agents interaction with gym env, stores as tuple (s, a, lp, r, d, ns)
+
+
+        Args:
+            render (bool, optional): Whether or not to visualise the interaction. Defaults to False.
+
+        Returns:
+            episodic_rewards (list): scalar rewards for each episode that the agent completes.
+        """
+
+        interaction_step = 0
+        episodic_rewards = []
+        state = self.env.reset()
+        done = False
+        curr_epi_reward = 0.
+
+        # while the current step isn't less than limit
+        while interaction_step < self.batch_size:
+           
+            # Interaction 
+            action, lp_old, _ = self.choose_action(state) # TODO: Unpack ent here when you add logging
+            next_state, reward, done, _ = self.env.step(action)
+            interaction_step += 1
+            curr_epi_reward += reward
+            print(action.shape)
+
+            # Storage
+            self.buffer.append([state, action, lp_old.detach(), reward, done, next_state])
             
+            if render: self.env.render()
+
+            # Dealing with episode end
+            if done:
+                episodic_rewards.append(curr_epi_reward)
+                state = self.env.reset()
+                curr_epi_reward = 0.
+            
+            else:
+                state = next_state # TODO: Might have to add copying at some point if this extends to different envs
         
-        pass
-    
+        return episodic_rewards
+
+
     def to_torch(self, x):
         """Helper fn for converting things to torch tensors
 
@@ -83,10 +121,10 @@ class PPO:
         
         # take the contents out of buffer and zip them to get vectors of s, a, lp, r, d, ns,
         # convert these to tensors
-        states, actions, log_prob_olds, rewards, dones, next_states = list(map(self.to_torch, *zip(self.buffer)))
+        states, actions, log_prob_olds, rewards, dones, next_states = list(map(self.to_torch, zip(*self.buffer)))
         
         #reshape
-
+        
         # compute value for first state 
         # compute next_state_values for next_states * (1-dones)
         # concat to get all values
@@ -102,10 +140,9 @@ class PPO:
         v_targets = advs + values_all[:-1] # use the current state values
         
         # make sure shapes are right       
-        assert states.shape == (self.batch_size, )
+        assert states.shape == (self.batch_size,) 
 
         return states, actions, log_prob_olds, rewards, dones, next_states, advs, v_targets
-
 
     def clear_buffer(self):
         self.buffer.clear()
@@ -141,9 +178,19 @@ class PPO:
         # log the policy loss, ration, advantage, entropy and log_prob
 
     def compute_lp_and_ent(self, states, actions):
+        """Gets policy distribution statistics for a given batch of state-action pairs
+        Args:
+            states (torch.Tensor): shape: (batch_size, *state_shape), dtype: float
+            actions (torch.Tensor): shape: (batch_size, *action_shape), dtype: float (gets converted to long if needed by Categorical)
+
+        Returns:
+            log_probs_new (torch.Tensor): log_prob for current policy distribution for state-action. shape: (batch_size,), dtype: float
+            entropies_new (torch.Tensor): entropy for current policy distribution at state. shape: (batch_size,), dtype: float
+        """
         assert torch.is_floating_point(states), states
-        assert actions.dtype == torch.long, actions
+        assert torch.is_floating_point(actions), actions
         assert len(actions) == len(states), (states.shape, actions.shape)
+        assert action.device == self.device
 
         # call sample on policy with the actions specified
         _, log_probs_new, entropies_new = self.policy.sample(states, actions)
@@ -209,10 +256,10 @@ class PPO:
         # print(action)
 
         # Convert to gym action and squeeze to deal with discrete action spaces
-        action = action.cpu().detach().numpy().squeeze(0)
+        action = action.cpu().detach().numpy().view(self.action_dim)
 
         # defensive programming outputs
-        assert self.env.action_space.contains(action), (action, action.shape, action.dtype, self.env.action_space)
+        assert self.env.action_space.contains(action), action
         assert log_prob.shape == (1,), log_prob
         assert entropy.shape == (1,), entropy
 
@@ -222,65 +269,50 @@ class PPO:
 # Run a simulation
 if __name__ == '__main__':
     
-    num_agents = 1
-    num_epi = 500
-    r = []    
-    env = gym.make('CartPole-v1')
-    policy_layers = [
-                    (nn.Linear, {'in_features': get_gym_space_shape(env.observation_space), 'out_features': 128}),
-                    (nn.ReLU, {}),
-                    (nn.Linear, {'in_features': 128, 'out_features': 64}),
-                    (nn.ReLU, {}),
-                    (nn.Linear, {'in_features': 64, 'out_features': get_gym_space_shape(env.action_space)}),
-                    (nn.ReLU, {})
-                    ]
+    envs = ['CartPole-v1', 'Pendulum-v0', 'LunarLanderContinuous-v2']
+    
+    for env_name in envs: 
+        print(env_name)
+        env = gym.make(env_name)
+        state_dim = get_gym_space_shape(env.observation_space)
+        action_dim = get_gym_space_shape(env.action_space)
+        policy_layers = [
+                        (nn.Linear, {'in_features': state_dim, 'out_features': 128}),
+                        (nn.ReLU, {}),
+                        (nn.Linear, {'in_features': 128, 'out_features': 64}),
+                        (nn.ReLU, {}),
+                        (nn.Linear, {'in_features': 64, 'out_features': action_dim}),
+                        (nn.ReLU, {})
+                        ]
 
 
-    critic_layers = [
-                    (nn.Linear, {'in_features': get_gym_space_shape(env.observation_space), 'out_features': 128}),
-                    (nn.ReLU, {}),
-                    (nn.Linear, {'in_features': 128, 'out_features': 64}),
-                    (nn.ReLU, {}),
-                    (nn.Linear, {'in_features': 64, 'out_features': 1})
-                    ]
+        critic_layers = [
+                        (nn.Linear, {'in_features': state_dim , 'out_features': 128}),
+                        (nn.ReLU, {}),
+                        (nn.Linear, {'in_features': 128, 'out_features': 64}),
+                        (nn.ReLU, {}),
+                        (nn.Linear, {'in_features': 64, 'out_features': 1})
+                        ]
 
     
-    ppo_args = {'gamma': 0.99,
-                'env': env,
-                'step_lim': 200,
-                'policy': GaussianPolicy(policy_layers, env.action_space),
-                'policy_optimiser': optim.Adam,
-                'policy_lr': 0.00075,
-                'critic' : Network(critic_layers),
-                'critic_lr': 0.00075,
-                'critic_optimiser': optim.Adam,
-                'critic_criterion': nn.MSELoss(),
-                'device': 'cuda' if torch.cuda.is_available() else 'cpu', 
-                'entropy_coef' : 0.05,
-                }
-        
-    
-    # # run experiment
-    # for i in range(num_agents):
-    #     print("Running training for agent number {}".format(i))
-    #     agent = PPO(ppo_args)
-        
-    #     # random.seed(i)
-    #     # np.random.seed(i)
-    #     # torch.manual_seed(i)
-    #     # env.seed(i)
-        
-    #     r.append(agent.train(num_epi))
+        ppo_args = {
+            'device': 'cpu',
+            'gamma': 0.99,
+            'env': env,
+            'batch_size': 512,
+            'mb_size': 64,
+            'num_train_passes': 5,
+            'pi_loss_clip': 0.1,
+            'lam': 0.7,
+            'entropy_coef': 0.01,
+            'critic': Network(critic_layers),
+            'critic_lr': 0.001,
+            'critic_optimiser': optim.Adam,
+            'critic_criterion': nn.MSELoss(),
+            'policy': CategoricalPolicy(policy_layers) if isinstance(env.action_space, Discrete) else GaussianPolicy(policy_layers, env.action_space),
+            'policy_lr': 0.003,
+            'policy_optimiser': optim.Adam
+        }   
 
-    # out = np.array(r).mean(0)
-
-    # plt.figure(figsize=(5, 3))
-    # plt.title('PPO on cartpole')
-    # plt.xlabel('Episode')
-    # plt.ylabel('Episodic Reward')
-    # plt.plot(out, label='rewards')
-    # plt.legend()
-
-    # # plt.savefig('./data/ppo_cartpole.PNG')
-    # plt.show()
+        agent = PPO(ppo_args)
     

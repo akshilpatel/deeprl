@@ -13,7 +13,7 @@ from typing import List, Tuple, Dict
 
 import random
 
-from deeprl.common.utils import get_gym_space_shape
+from deeprl.common.utils import net_gym_space_dims
 from deeprl.common.base import Network
 from deeprl.common.replay_buffers import Memory
 import multiprocessing as mp
@@ -163,8 +163,8 @@ if __name__ == '__main__':
     
     cartpole_env = gym.make('CartPole-v1')
     env2 = gym.make('BipedalWalker-v3')
-    input_dim = get_gym_space_shape(cartpole_env.observation_space)
-    output_dim = get_gym_space_shape(cartpole_env.action_space)
+    input_dim = net_gym_space_dims(cartpole_env.observation_space)
+    output_dim = net_gym_space_dims(cartpole_env.action_space)
     net_layers = [(nn.Linear, {"in_features": input_dim, "out_features": 32}),
                   (nn.ReLU, {}),
                   (nn.Linear, {"in_features": 32, "out_features": 16}),

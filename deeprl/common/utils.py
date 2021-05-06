@@ -1,11 +1,20 @@
 from gym.spaces import Box, Discrete
 import numpy as np
 
-def get_gym_space_shape(space):
+def net_gym_space_dims(space):
     if isinstance(space, Box):
         return space.shape[0]
     elif isinstance(space, Discrete):
         return space.n
+    else:
+        raise TypeError("You haven't input a valid gym space. Here is your input: {}".format(space))
+
+
+def get_gym_space_shape(space):
+    if isinstance(space, Box):
+        return space.shape
+    elif isinstance(space, Discrete):
+        return (space.n,)
     else:
         raise TypeError("You haven't input a valid gym space. Here is your input: {}".format(space))
 

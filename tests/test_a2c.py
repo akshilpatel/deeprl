@@ -14,7 +14,7 @@ from copy import deepcopy
 
 
 
-from deeprl.common.utils import get_gym_space_shape
+from deeprl.common.utils import net_gym_space_dims
 from deeprl.common.base import Network, CategoricalPolicy, GaussianPolicy
 from deeprl.algos.vpg.vpg import VPG
 

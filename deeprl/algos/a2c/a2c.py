@@ -13,7 +13,7 @@ from typing import List, Tuple, Dict
 
 import random
 
-from deeprl.common.utils import get_gym_space_shape
+from deeprl.common.utils import net_gym_space_dims
 from deeprl.common.base import Network
 import multiprocessing as mp
 from torch.distributions import Categorical, Normal
@@ -284,17 +284,17 @@ if __name__ == '__main__':
     r = []    
     env = gym.make('LunarLanderContinuous-v2')
     policy_layers = [
-                    (nn.Linear, {'in_features': get_gym_space_shape(env.observation_space), 'out_features': 128}),
+                    (nn.Linear, {'in_features': net_gym_space_dims(env.observation_space), 'out_features': 128}),
                     (nn.ReLU, {}),
                     (nn.Linear, {'in_features': 128, 'out_features': 64}),
                     (nn.ReLU, {}),
-                    (nn.Linear, {'in_features': 64, 'out_features': get_gym_space_shape(env.action_space)}),
+                    (nn.Linear, {'in_features': 64, 'out_features': net_gym_space_dims(env.action_space)}),
                     (nn.ReLU, {})
                     ]
 
 
     critic_layers = [
-                    (nn.Linear, {'in_features': get_gym_space_shape(env.observation_space), 'out_features': 128}),
+                    (nn.Linear, {'in_features': net_gym_space_dims(env.observation_space), 'out_features': 128}),
                     (nn.ReLU, {}),
                     (nn.Linear, {'in_features': 128, 'out_features': 64}),
                     (nn.ReLU, {}),
