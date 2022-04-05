@@ -196,7 +196,7 @@ class VPG:
 if __name__ == '__main__':
     
     # setup params
-    env = gym.make('MountainCar-v0')
+    env = gym.make('CartPole-v0')
     input_dim = net_gym_space_dims(env.observation_space)
     output_dim = net_gym_space_dims(env.action_space)
     print(input_dim, output_dim)
@@ -220,7 +220,7 @@ if __name__ == '__main__':
                 }
 
     num_agents = 5
-    num_epi = 300
+    num_epi = 150
     r = []
     losses = []
     gts = []

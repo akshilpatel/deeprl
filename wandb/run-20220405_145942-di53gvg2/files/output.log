@@ -1,0 +1,23 @@
+
+Running training for agent number 0
+C:\Users\akshil\Desktop\Extracurricular\coding_practice\deeprl\deeprl\algos\a2c\a2c.py:230: UserWarning: Creating a tensor from a list of numpy.ndarrays is extremely slow. Please consider converting the list to a single numpy.ndarray with numpy.array() before converting to a tensor. (Triggered internally at  ..\torch\csrc\utils\tensor_new.cpp:210.)
+  state = torch.tensor([state], dtype=torch.float, device=self.device)
+Episode 0, Reward 16.0
+Episode 10, Reward 24.0
+Episode 20, Reward 13.0
+Episode 30, Reward 15.0
+Episode 40, Reward 13.0
+Episode 50, Reward 9.0
+Episode 60, Reward 31.0
+Episode 70, Reward 43.0
+Episode 80, Reward 27.0
+Traceback (most recent call last):
+  File "C:\Users\akshil\Desktop\Extracurricular\coding_practice\deeprl\deeprl\algos\a2c\a2c.py", line 313, in <module>
+    r.append(agent.train(num_epi))
+  File "C:\Users\akshil\Desktop\Extracurricular\coding_practice\deeprl\deeprl\algos\a2c\a2c.py", line 60, in train
+    total_rewards[i] = self.run_episode(render=render)
+  File "C:\Users\akshil\Desktop\Extracurricular\coding_practice\deeprl\deeprl\algos\a2c\a2c.py", line 81, in run_episode
+    next_state, reward, done, _ = self.env.step(action)
+  File "C:\Users\akshil\AppData\Local\Programs\Python\Python310\lib\site-packages\gym\wrappers\time_limit.py", line 16, in step
+    def step(self, action):
+KeyboardInterrupt

@@ -10,26 +10,26 @@ from gym import Space
 
 from copy import deepcopy
 from typing import List, Tuple, Dict
-
+import multiprocessing as mp
+from torch.distributions import Categorical, Normal
 import random
 
 from deeprl.common.utils import get_gym_space_shape, discount_cumsum, net_gym_space_dims
 from deeprl.common.base import Network
-import multiprocessing as mp
-from torch.distributions import Categorical, Normal
+from deeprl.common.replay_buffers import OnPolicyMemory
 from deeprl.common.base import CategoricalPolicy, GaussianPolicy
 from torch.utils.tensorboard import SummaryWriter
-
+torch.utils.backcompat.broadcast_warning.enabled=True
 class PPO:
     def __init__(self, params):
         self.device = params['device']
         self.gamma = params['gamma']       
         self.env = params['env']
+        self.state_dim = get_gym_space_shape(self.env.observation_space)
         self.action_dim = get_gym_space_shape(self.env.action_space)
         self.batch_size = params['batch_size']
         self.mb_size = params['mb_size']
         self.num_train_passes = params['num_train_passes']
-        self.pi_loss_clip = params['pi_loss_clip']
         self.lam = params['lam']
         self.gamma_lam = self.gamma * self.lam
         self.entropy_coef = params['entropy_coef']
@@ -42,11 +42,13 @@ class PPO:
         self.critic_criterion = params['critic_criterion']
 
         # Policy
+        self.pi_loss_clip = params['pi_loss_clip']
         self.policy = params['policy'].to(self.device)
         self.policy_lr = params['policy_lr'] 
         self.policy_optimiser = params['policy_optimiser'](self.policy.parameters(), self.policy_lr)
         
-        self.buffer = deque(maxlen=self.batch_size)     
+        # Memory
+        self.buffer = OnPolicyMemory(self.batch_size, self.device)
         
     # TODO: Add logging
     # TODO: Currently this resets env even if the last call of generate_experience didn't terminate the episode - fix this
@@ -79,7 +81,7 @@ class PPO:
             curr_epi_reward += reward
             
             # Storage
-            self.buffer.append([state, action.reshape(self.action_dim), lp_old.detach(), reward, done, next_state])
+            self.buffer.store([state, action.reshape(self.action_dim), lp_old.detach(), reward, done, next_state])
             
             if render: self.env.render()
 
@@ -95,70 +97,107 @@ class PPO:
         return episodic_rewards
 
     def to_torch(self, x):
-        """Helper fn for converting things to torch tensors
+        """Helper function for converting things to torch tensors
 
         Args:
-            x (iterable): contains the thing to be converted to tensor (batch_size, data_dims)
+            x (iterable): contains the thing to be converted to tensor shape: (batch_size, data_dims) - with any unecessary dims
 
         Returns:
-            torch.Tensor : [description]
+            torch.Tensor: shape: (batch_size, data_dims) - without unecessary dims, dtype: float, requires_grads: False, device: agent.device
         """
-        return torch.tensor(x).float().to(self.device).squeeze()
+        return torch.tensor(x).float().to(self.device).squeeze() # squeeze to ensure consistent shapes over different envs
     
     @torch.no_grad()
     def compute_gaes(self, rewards, all_values, dones):
+        """Given a vector of rewards and values over potentially several episodes, 
 
+        Args:
+            rewards (torch.Tensor): shape: (batch_size,)
+            all_values (torch.Tensor): (batch_size + 1,) tensor of state_values with terminal states having 0 value
+            dones (torch.Tensor): (batch_size,)
+
+        Returns:
+            advs (torch.Tensor): shape (batch_size,)
+        """
         # compute deltas = r + gamma * values[:-1] - values[1:]
-        deltas = rewards + self.gamma * all_values[:-1] - all_values[1:]
+        curr_vals = all_values[:-1] 
+        next_vals = all_values[1:] 
+        deltas = rewards + self.gamma * next_vals - curr_vals
         
+
         advs = discount_cumsum(deltas, dones, self.gamma_lam)
         advs = torch.from_numpy(advs).to(self.device)
+        
         return advs
 
     @torch.no_grad()
     def preprocess_buffer(self):
+        """Retrieves rollout from buffer and computes GAE, V targets, and outputs what is needed for updates
+
+        Returns:
+            states (torch.Tensor): shape: (batch_size, *state_dim), dtype:float
+            actions (torch.Tensor): shape: (batch_size, *action_dim)
+            log_prob_olds: shape: (batch_size,), dtype:float, requires_grads:false
+            advs: shape: (batch_size,), dtype:float, requires_grads:false
+            v_targets: shape: (batch_size,), dtype:float, requires_grads:false
+        """
         
         # take the contents out of buffer and zip them to get vectors of s, a, lp, r, d, ns,
         # convert these to tensors
-        states, actions, log_prob_olds, rewards, dones, next_states = list(map(self.to_torch, zip(*self.buffer)))
-        
+        states, actions, log_prob_olds, rewards, dones, next_states = self.buffer.retrieve_experience()
         #reshape
-        first_state_value = self.critic(states[0])
-        next_state_values = self.critic(next_states) * (1-dones)
-        all_values = torch.stack([first_state_value, next_state_values])
+        first_state = states[0].unsqueeze(0)
+        assert first_state.dim() > 1
+        assert first_state.shape == (1, *self.state_dim), (first_state.shape, self.state_dim)
+        
+        first_state_value = self.critic(first_state) # this state is never terminal
+        next_state_values = self.critic(next_states) * (1 - dones.unsqueeze(-1))
+        all_values = torch.cat([first_state_value, next_state_values]).squeeze(-1)
 
-        # compute adv
-        advs = self.compute_gaes(rewards, all_values, dones) # fix this
+        assert all_values.shape  == (self.batch_size + 1,)
+
+        # no grad here
+        advs = self.compute_gaes(rewards, all_values, dones) 
         
-        # using old critic estimation of values for target
-        v_targets = advs + all_values[:-1] # use the current state values
+        # using old critic for estimation of value targets
+        v_targets = advs + all_values[:-1] # add only the current state values 
         
-        # make sure shapes are right       
         return states, actions, log_prob_olds, advs, v_targets
 
     def clear_buffer(self):
-        self.buffer.clear()
+        self.buffer.reset_buffer()
     
     def update(self):
         # Call preprocess buffer - states, actions, rewards, log_prob_olds, next_states, 
-        states, actions, log_prob_olds, advs, v_targets = self.preprocess_buffer()
-        poss_idc = random.shuffle(range(len(states)))
-        sample_idc = poss_idc
+        states, actions, log_probs_old, advs, v_targets = self.preprocess_buffer()
+        poss_idc = random.shuffle(list(range(len(states))))
+        sample_idc = poss_idc # TODO: Fix this
+        print(poss_idc)
 
         for train_i in range(self.num_train_passes):
-            # random sample indices to make a minibatch of s, a, r, ... 
+            
+            # Random sample indices to make a minibatch of s, a, r, ... 
             sample_idc = random.sample(poss_idc, self.mb_size)
             s_sample = states[sample_idc]
             a_sample = actions[sample_idc]
-            lp_old_sample = log_prob_olds[sample_idc]
+            lp_old_sample = log_probs_old[sample_idc]
             adv_sample = advs[sample_idc]
             v_target_sample = v_targets[sample_idc]
 
-            policy_loss = self.update_policy(s_sample, a_sample, lp_old_sample, adv_sample)
-            critic_loss = self.update_critic(s_sample, v_target_sample)
+            # Policy update
+            policy_loss = self.compute_policy_loss(s_sample, a_sample, lp_old_sample, adv_sample)
+            self.policy_optimiser.zero_grad()
+            policy_loss.backward()      
+            self.policy_optimiser.step()
 
-    def update_policy(self, states, actions, log_probs_old, advs):
-        """Compute the policy loss and update the policy given the required no_grad computations
+            # Critic update
+            critic_loss = self.compute_critic_loss(s_sample, v_target_sample)
+            self.critic_optimiser.zero_grad()
+            critic_loss.backward()
+            self.critic_optimiser.step()
+
+    def compute_policy_loss(self, states, actions, log_probs_old, advs):
+        """Compute the policy loss given the required no_grad computations
 
         Args:
             states (torch Tensor): shape: (mb_size, state_dims), dtype: float
@@ -173,28 +212,34 @@ class PPO:
         advs /= advs.std()
 
         # Get the current log_prob for a|s - with gradients
-        log_probs_new, entropies_new = self.policy.sample(states, actions)
+        print(actions.shape)
+        _, log_probs_new, entropies_new = self.policy.sample(states, actions.squeeze(-1)) # squeeze to prevent broadcasting
         
-        assert log_probs_new.shape == (len(actions),)
-        assert entropies_new.shape == (len(actions),)
-        assert torch.is_floating_point(log_probs_new)
-        assert torch.is_floating_point(entropies_new)
+        assert log_probs_new.shape == advs.shape, (log_probs_new.shape, advs.shape, states.shape)
+        assert entropies_new.shape == advs.shape
         assert log_probs_new.requires_grad
         assert entropies_new.requires_grad
 
         # Compute ratio = exp(log_prob_curr - log_prob_old) - grads for log_prob_curr
-        ratio = torch.exp(log_probs_new - log_probs_old)        
+        ratio = torch.exp(log_probs_new - log_probs_old)
+
+        assert ratio.shape == advs.shape
+
         g = torch.where(advs >= 0, (1 + self.pi_loss_clip) * advs, (1 - self.pi_loss_clip) * advs)
-        policy_loss = - torch.min(ratio* advs, g) - entropies_new.mean() * self.entropy_coef
-
-        self.policy_optimiser.zero_grad()
-        policy_loss.backward()
-        self.policy_optimiser.step()
         
-        return policy_loss.item()
+        assert g.shape == advs.shape
 
-    def update_critic(self, states, v_targets):
-        """Minibatch update for the critic given a sample of states and corresponding targets
+        policy_loss = - torch.min(ratio * advs, g) - entropies_new.mean() * self.entropy_coef
+        
+        assert policy_loss.shape == (advs.shape)
+        assert policy_loss.requires_grad
+
+        policy_loss = policy_loss.mean()
+
+        return policy_loss
+
+    def compute_critic_loss(self, states, v_targets):
+        """Compute minibatch loss for the critic given a sample of states and corresponding targets
 
         Args:
             states (torch Tensor): shape: (mb_size, state_dim), dtype: float
@@ -207,10 +252,7 @@ class PPO:
         v_preds = self.critic(states)
         critic_loss = self.critic_criterion(v_preds, v_targets)
         
-        self.critic_optimiser.zero_grad()
-        critic_loss.backward()
-        self.critic_optimiser.step()
-        return critic_loss.item()
+        return critic_loss
 
     def train(self, num_epochs, render=False):
         """Interface function which is used to run the agent's learning
@@ -314,4 +356,4 @@ if __name__ == '__main__':
         }   
 
         agent = PPO(ppo_args)
-    
+        agent.train(10)  

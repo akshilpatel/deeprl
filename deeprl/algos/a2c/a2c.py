@@ -1,17 +1,13 @@
+from cv2 import log
 import gym
 import numpy as np
 import torch
 from torch import nn, optim
 import matplotlib.pyplot as plt
-from collections import deque
-from gym.spaces.box import Box
-from gym.spaces.discrete import Discrete
-from gym import Space
 
-from copy import deepcopy
+
 from typing import List, Tuple, Dict
 
-import random
 
 from deeprl.common.utils import net_gym_space_dims
 from deeprl.common.base import Network
@@ -19,58 +15,179 @@ import multiprocessing as mp
 from torch.distributions import Categorical, Normal
 from deeprl.common.base import CategoricalPolicy, GaussianPolicy
 
-
+import wandb
 
 class A2C:
-    def __init__(self, params):
-        self.device = params['device']
-        self.gamma = params['gamma']       
-        self.env = params['env']
-        self.step_lim = params['step_lim']
+    def __init__(self, args):     
+        self.device = args["device"]
+        self.gamma = args["gamma"]
+        self.env = args["env"]
+        self.step_lim = args["step_lim"]
 
         # Critic
-        self.critic = params['critic'].to(self.device)
-        self.critic_lr = params['critic_lr']
-        self.critic_optimiser = params['critic_optimiser'](self.critic.parameters(), self.critic_lr)
-        self.critic_criterion = params['critic_criterion']
+        self.critic = args["critic"].to(self.device)
+        self.critic_lr = args["critic_lr"]
+        self.critic_optimiser = args["critic_optimiser"](
+            self.critic.parameters(), self.critic_lr
+        )
+        self.critic_criterion = args["critic_criterion"]
 
         # Policy
-        self.policy = params['policy'].to(self.device)
-        print(self.policy)
-        self.policy_lr = params['policy_lr'] 
-        self.policy_optimiser = params['policy_optimiser'](self.policy.parameters(), self.policy_lr)
-        self.entropy_coef = params['entropy_coef']
+        self.policy = args["policy"].to(self.device)
+        self.policy_lr = args["policy_lr"]
+        self.policy_optimiser = args["policy_optimiser"](
+            self.policy.parameters(), self.policy_lr
+        )
+        self.entropy_coef = args["entropy_coef"]
+        # self.adv_n = 0.
+        # self.adv_mean = 0.
 
-    
-    def choose_action(self, state):
-        """Calls the policy network to sample an action for a given state. The log_prob of the action and the entropy of the distribution are also recorded for updates.
+
+    def train(self, num_episodes:int, render=False, verbose=True) -> np.array:
+        """This is a wrapper method around the `run_episode` method. We use `train` mehod for running experiments. 
 
         Args:
-            state (numpy array): current state of the environment
+            num_episodes (int): The number of episodes for which to run training.
+            render (bool, optional): Flag used to render episodes to watch training. Defaults to False.
+            verbose (bool, optional): Used to decide if we should . Defaults to True.
 
         Returns:
-            action (numpy array, (gym action_dim))
-            torch float tensor (1, 1): log probability of policy distribution used to sample the action
-            torch float tensor (1, 1): entropy of policy distribution used to sample the action
+            numpy array: Array of shape (num_episodes,) which contains the episodic rewards returned by the `run_episode` method. 
         """
-        # defensive programming inputs
-        assert self.env.observation_space.contains(state), state
+
+        total_rewards = np.zeros(num_episodes)
+        for i in range(num_episodes):
+            total_rewards[i] = self.run_episode(render=render) 
+
+            if i%10==0 and verbose:
+                print("Episode {}, Reward {}".format(i, total_rewards[i]))
+        return total_rewards
+
+    def run_episode(self, render=False):
+        """Functionality for running an episode with updating.
+
+        Args:
+            render (bool, optional): Flag used to render episodes to watch training. Defaults to False. Defaults to False.
+
+        Returns:
+            _type_: _description_
+        """
+        state = self.env.reset()
+        episodic_reward = 0.
+        step_counter = 0
+        while step_counter < self.step_lim:
+            
+            action, log_prob, entropy = self.choose_action(state)
+            next_state, reward, done, _ = self.env.step(action)
+
+            episodic_reward += reward 
+            step_counter +=1
+            
+            if render: self.env.render()
+            
+            losses = self.update(state, reward, next_state, done, log_prob, entropy)
+            
+            if done: 
+                # print(losses)
+                break
+
+            state = next_state
+
+        wandb.log({"episodic_reward": episodic_reward})
+        return episodic_reward
+
+    def update(self, state, reward, next_state, done:bool, log_prob, entropy):
+        """One step update which:
+        1) Converts the experience to tensors and puts on the correct device
+        2) Calls `.compute_adv_and_td_target` method to compute the advantage and td_target (without gradients) 
+        3) Calls the `update_policy` and `update_critic` methods using the advantage and td_target to update both policy and critic.
+
+        Args:
+            state (numpy array): State from which the agent starts the transition
+            reward (float or int): One step reward for the transition
+            next_state (numpy array): Next state after taking the action.
+            done (bool): True iff the next_state was terminal. 
+            log_prob (torch.FloatTensor): shape=(1,1)
+            entropy (torch.FloatTensor): shape=(1,1)
+
+        Returns:
+            Tuple(float, float): (Policy Loss, Critic Loss) computed for the transition.
+        """
 
         state = torch.tensor([state], dtype=torch.float, device=self.device)
-        action, log_prob, entropy = self.policy.sample(state)
+        next_state = torch.tensor([next_state], dtype=torch.float, device=self.device)
+        # done = torch.tensor(done, dtype=torch.int, device=self.device) # are these two lines needed since they don't go through a model.
+        # reward = torch.tensor(reward, dtype=torch.float, device=self.device)
 
-        # Convert to gym action and squeeze to deal with discrete action spaces
-        action = action.cpu().detach().numpy().squeeze()
+        # print(state, next_state, done, reward)
 
-        # defensive programming outputs
-        assert self.env.action_space.contains(action), action
-        assert log_prob.shape == (1,), log_prob
-        assert entropy.shape == (1,), entropy
+        # These are both targets so no need to track grads
+        # with torch.no_grad():
+        adv, td_target = self.compute_adv_and_td_target(state, reward, next_state, done)
 
-        return action, log_prob, entropy
+        assert not adv.requires_grad
+        assert not td_target.requires_grad
+
+        policy_loss = self.update_policy(log_prob, entropy, adv)
+        critic_loss = self.update_critic(td_target, state)
+
+        return policy_loss, critic_loss
+
+    def update_policy(self, log_prob, entropy, adv):
+        """Computes the policy loss and updates the policy network
+
+        Args:
+            log_prob (torch.tensor): Log probability of action taken by agent.
+            entropy (torch.tensor): Entropy value for transitions.
+            adv (torch.tensor): Advantage value for the transitions.
+
+        Returns:
+            float: policy loss computed for transition.
+        """
+        assert not adv.requires_grad
+        assert log_prob.requires_grad
+        # print(log_prob)
+        # print(adv)
+        
+        policy_loss = -(log_prob * adv) - (entropy * self.entropy_coef)
+        # print(policy_loss, policy_loss.shape)
+        policy_loss = policy_loss.squeeze()
+
+        self.policy_optimiser.zero_grad()
+        policy_loss.backward()
+        # nn.utils.clip_grad_norm_(self.policy.parameters(), 0.2)
+        self.policy_optimiser.step()
+        wandb.log({"policy_loss": policy_loss.item()})
+        return policy_loss.item()
+
+    def update_critic(self, td_target, state):
+        """Used to compute loss and update for critic
+
+        Args:
+            td_target (torch.tensor): r + gamma * V(next_state) * (1 - done)
+            state (torch.tensor): State in transition
+
+        Returns:
+            float: critic loss
+        """
+       
+
+        current_state_val = self.critic(state)
+        
+        critic_loss = self.critic_criterion(current_state_val, td_target)
+        
+        self.critic_optimiser.zero_grad()
+        critic_loss.backward()
+        
+        # nn.utils.clip_grad_norm_(self.critic.parameters(), 0.2)
+        self.critic_optimiser.step()
+
+        wandb.log({"critic_loss": critic_loss.item()})
+        
+        return critic_loss.item()
 
     @torch.no_grad()
-    def update_helper(self, state, next_state, reward, done):
+    def compute_adv_and_td_target(self, state, reward, next_state, done):
         """
         Computes the td_target and advantage for policy and critic updates. No gradients are tracked.
         
@@ -81,252 +198,118 @@ class A2C:
             done (boole): true iff next_state of the transition was terminal
 
         Returns:
-            advantage (torch tensor, float, (1, 1)): r + gamma * V(s') * (1-done) - V(s)
+            advantage (torch tensor, float, (1, 1)): td_target - V(s)
             td_target (torch tensor, float, (1, 1)): r + gamma * V(s') * (1-done)
         """
-        # defensive programming inputs        
-        assert type(self.gamma) == float
-        assert torch.is_floating_point(state)
-        assert torch.is_floating_point(next_state)
-        assert torch.is_floating_point(reward)
-        assert reward.shape == (1, 1), reward.shape
-        assert type(done) == torch.Tensor
-
-        # r + gamma * (1-done) * V(s') - target for estimated Q(s, a)
-        v_next = self.critic(next_state) * (1-done)
-        td_target = reward + (self.gamma * v_next)
-
-        # target for Q(s, a) - V(s)
-        v_current = self.critic(state)
-        advantage = td_target - v_current
-
-        # print(td_target)
-        # defensive programming outputs
-        assert torch.is_floating_point(advantage)
-        assert torch.is_floating_point(td_target)
-        assert advantage.shape == (1, 1)
-        assert td_target.shape == (1, 1)
         
-        return advantage, td_target
-    
-    def update_policy(self, advantage, log_prob, entropy):
-        """
-        Computes policy loss: - adv * log_prob 
-        Computes gradients
-        Updates policy params
-
-        Args:
-            advantage (torch tensor float (1,1)): tensor containing estimated r + gamma*V(s') - V(s)
-            log_prob (torch tensor float (1, 1)): log prob of taken the action chosen
-            entropy (torch tensor float (1, 1)): entropy of prob distribution used to sample the action
-        """
-        # defensive programming
-        assert torch.is_floating_point(advantage)
-        assert torch.is_floating_point(log_prob)
-        assert torch.is_floating_point(entropy)
-        assert log_prob.shape == (1, 1)
-        assert advantage.shape == (1, 1)
-        assert entropy.shape == (1, 1)
-        assert log_prob.requires_grad
-        assert entropy.requires_grad
-
-        # compute the loss: - A(s, a) * log(P(a|s)) - Beta * H(s)
-        policy_loss = - (log_prob * advantage) - (self.entropy_coef * entropy)
-        policy_loss = policy_loss.squeeze()
-        assert policy_loss.shape == ()
+        td_target = reward + self.gamma * self.critic(next_state) * (1-done)
+        adv = td_target - self.critic(state)
         
-
-        # update
-        self.policy_optimiser.zero_grad()
-        policy_loss.backward()
-        # nn.utils.clip_grad_norm_(self.policy.parameters(), 0.2)
-        self.policy_optimiser.step()
-        
-        
-
-    def update_critic(self, state, td_target):
-        """
-        Given a state and target, compute the predicted value and fit to the target
-
-        Args:
-            state (torch tensor, float, (1, state_shape)): current state
-            td_target (torch tensor float): r + gamma * V(next_state), no grads estimate
-        """
-
-        # defensive programming
-        assert torch.is_floating_point(state)
-        assert state.shape == (1, *self.env.observation_space.shape)
-
-        v_pred = self.critic(state)
-
-        assert torch.is_floating_point(td_target)
-        assert v_pred.shape == (1, 1)
-        assert td_target.shape == (1, 1)
-        assert v_pred.requires_grad
         assert not td_target.requires_grad
-
-        critic_loss = self.critic_criterion(v_pred, td_target).squeeze()
-        self.critic_optimiser.zero_grad()
-        critic_loss.backward()
-        # nn.utils.clip_grad_norm_(self.critic.parameters(), 0.2)
-        self.critic_optimiser.step()
-
-    def update(self, state, log_prob, entropy, reward, next_state, done):
-        """
-        One step update wrapper for policy and critic updates.
+        assert not adv.requires_grad
+        assert adv.shape == (1,1)
+        assert td_target.shape == (1,1)
         
-        0) Convert state, next_state, done to a tensor
-        1) With no_grad: Compute advantage = td_target - value(s) -> advantage, td_target
-        2) Policy Update: loss = - log prob * advantage - entropy * entropy_coef
-        3) Critic Update(td_target, state, reward)
+        wandb.log({"advantage": adv.item()})
+        wandb.log({"td_target": td_target.item()})
+
+        return adv, td_target
+
+    
+    def choose_action(self, state):
+        """Calls the policy network to sample an action for a given state. The log_prob of the action and the entropy of the distribution are also recorded for updates.
 
         Args:
             state (numpy array): current state of the environment
-            log_prob (torch float tensor of shape [1,]): log probability of the chosen action
-            entropy (torch float tensor of shape [1,]): entropy of the distribution used to sample the chosen action
-            reward (float): one step reward from the environment
-            next_state (numpy array): next state after taking the action in the current state
-            done (bool): true iff next_state is terminal
-        """
-        # defensive programming
-        assert self.env.observation_space.contains(state)
-        assert self.env.observation_space.contains(next_state)
-        assert torch.is_floating_point(log_prob)
-        assert torch.is_floating_point(entropy)
-        assert log_prob.shape == (1,)
-        assert entropy.shape == (1,)
-        assert isinstance(reward, (int, float)), (type(reward), reward)
-        assert isinstance(done, bool)
-        assert log_prob.requires_grad
-        assert entropy.requires_grad
-        
-
-        # Convert to tensors of shape 1,1 and on self.device
-        state = torch.tensor(state, dtype=torch.float, device=self.device).unsqueeze(0)
-        next_state = torch.tensor(next_state, dtype=torch.float, device=self.device).unsqueeze(0)
-        done = torch.tensor(done, dtype=torch.long, device=self.device).view(1, 1)
-        reward = torch.tensor(reward, dtype=torch.float, device=self.device).view(1, 1)
-        log_prob = log_prob.unsqueeze(-1)
-        entropy = entropy.unsqueeze(-1)
-
-        # Compute advantage and td_target with no grad
-        advantage, td_target = self.update_helper(state, next_state, reward, done)
-        
-        assert not advantage.requires_grad
-        assert not td_target.requires_grad
-
-        self.update_policy(advantage, log_prob, entropy)
-        self.update_critic(state, td_target)
-
-
-    def run_episode(self, render=False):
-        """
-        The agent collects experience by simulating the environment here. 
-        There are two components:
-        1) Generating experience
-        2) Processing the experience for learning and then calling the update
-
-        Args:
-            render (bool, optional): Dictates whether the agent's play is visualised. Defaults to False.
 
         Returns:
-            total_reward (float): Sum of one-step rewards for the environment 
-        """
+            numpy array (gym action_dim): action selected
+            torch float tensor (1, 1): log probability of policy distribution used to sample the action
+            torch float tensor (1, 1): entropy of policy distribution used to sample the action
+        """ 
+        state = torch.tensor([state], dtype=torch.float, device=self.device)
+        action, log_prob, entropy = self.policy.sample(state)
 
-        # Initialise environment
-        state = self.env.reset()
-        total_reward = 0.
-        time_step = 0
+        action = action.cpu().detach().numpy().squeeze()
         
-        while time_step < self.step_lim:
-            # Generate experience
-            action, log_prob, entropy = self.choose_action(state)
-            next_state, reward, done, _ = self.env.step(action)
-            total_reward += reward
-            time_step += 1
-            if render: self.env.render()
-            
-            # One-step update
-            self.update(state, log_prob, entropy, reward, next_state, done)
-            
-            if done: break
-            
-            state = next_state 
-                
-        return total_reward
-    
-    def train(self, num_epi, render=False):
-        """Simulates agent's training phase with environment and tracks performance
+        assert self.env.action_space.contains(action)
+        wandb.log({"lp": log_prob.item()})
+        wandb.log({"entropy": entropy.item()})
 
-        Args:
-            num_epi (int): number of episodes to simulate
-            render (bool, optional): Dictates if we can watch the training in real time. Defaults to False.
-
-        Returns:
-            epi_rewards (list(float)): Track of episodic rewards for training
-        """
-        epi_rewards = [0 for _ in range(num_epi)] 
-        
-        for i in range(num_epi):
-            # Progress indicator
-            if i % 100 == 0:
-                print('Episode number: {}'.format(i))
-            epi_rewards[i] = self.run_episode(render)
-
-        return epi_rewards
+        return action, log_prob, entropy
 
 
-# Run a simulation
-if __name__ == '__main__':
-    
-    num_agents = 1
-    num_epi = 500
-    r = []    
-    env = gym.make('LunarLanderContinuous-v2')
+
+if __name__ == "__main__":
+
+    ENVNAME = "CartPole-v1"
+
+    env = gym.make(ENVNAME)
+
     policy_layers = [
-                    (nn.Linear, {'in_features': net_gym_space_dims(env.observation_space), 'out_features': 128}),
-                    (nn.ReLU, {}),
-                    (nn.Linear, {'in_features': 128, 'out_features': 64}),
-                    (nn.ReLU, {}),
-                    (nn.Linear, {'in_features': 64, 'out_features': net_gym_space_dims(env.action_space)}),
-                    (nn.ReLU, {})
-                    ]
-
+        (nn.Linear,
+            {"in_features": net_gym_space_dims(env.observation_space),
+            "out_features": 32}),
+        (nn.Tanh, {}),
+        (nn.Linear,
+            {"in_features": 32,
+            "out_features": 32}),
+        (nn.Tanh, {}),
+        (nn.Linear,{"in_features": 32, "out_features": net_gym_space_dims(env.action_space)}),
+    ]
 
     critic_layers = [
-                    (nn.Linear, {'in_features': net_gym_space_dims(env.observation_space), 'out_features': 128}),
-                    (nn.ReLU, {}),
-                    (nn.Linear, {'in_features': 128, 'out_features': 64}),
-                    (nn.ReLU, {}),
-                    (nn.Linear, {'in_features': 64, 'out_features': 1})
-                    ]
+        (nn.Linear, {"in_features": net_gym_space_dims(env.observation_space), "out_features": 32}),
+        (nn.ReLU, {}),
+        (nn.Linear,
+            {"in_features": 32,
+            "out_features": 32}),
+        (nn.ReLU, {}),
+        (nn.Linear, {"in_features": 32, "out_features": 1}),
+    ]
 
-    
-    a2c_args = {'gamma': 0.99,
-                'env': env,
-                'step_lim': 200,
-                'policy': GaussianPolicy(policy_layers, env.action_space),
-                'policy_optimiser': optim.Adam,
-                'policy_lr': 0.00075,
-                'critic' : Network(critic_layers),
-                'critic_lr': 0.00075,
-                'critic_optimiser': optim.Adam,
-                'critic_criterion': nn.MSELoss(),
-                'device': 'cuda' if torch.cuda.is_available() else 'cpu', 
-                'entropy_coef' : 0.05
-                }
+    a2c_args = {
+        "gamma": 0.99,
+        "env": env,
+        "step_lim": 200,
+        "policy": CategoricalPolicy(policy_layers),
+        "policy_optimiser": optim.Adam,
+        "policy_lr": 0.001,
+        "critic": Network(critic_layers),
+        "critic_lr": 0.001,
+        "critic_optimiser": optim.Adam,
+        "critic_criterion": nn.MSELoss(),
+        "device": "cuda",
+        "entropy_coef": 0.01,
+    }
+
+    num_agents = 5
+    num_epi = 200
+    r = []
+
+    wandb.init(project="deeprl", name="a2c-cartpole", entity="akshil")
+    wandb.config = {
+        "environment": ENVNAME,
+        "policy_layers": policy_layers,
+        "critic_layers": critic_layers,
+        "gamma": a2c_args["gamma"],
+        "entropy_coef": a2c_args["entropy_coef"],
+        "step_lim": a2c_args["step_lim"],
+        "policy_lr": a2c_args["policy_lr"],
+        "critic_lr": a2c_args["critic_lr"], 
+        "num_agents": num_agents,
+        "num_episodes": num_epi}
         
-    
-    # run experiment
+
     for i in range(num_agents):
         print("Running training for agent number {}".format(i))
         agent = A2C(a2c_args)
-        
+            
         # random.seed(i)
         # np.random.seed(i)
         # torch.manual_seed(i)
         # env.seed(i)
-        
+
         r.append(agent.train(num_epi))
 
     out = np.array(r).mean(0)
@@ -340,4 +323,3 @@ if __name__ == '__main__':
 
     # plt.savefig('./data/a2c_cartpole.PNG')
     plt.show()
-    

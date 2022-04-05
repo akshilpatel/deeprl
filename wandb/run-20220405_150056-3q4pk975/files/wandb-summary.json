@@ -1,0 +1,1 @@
+{"lp": -0.0467987060546875, "_timestamp": 1649167814, "_runtime": 558, "_step": 191020, "entropy": 0.1857164353132248, "advantage": 0.30086517333984375, "td_target": 64.91192626953125, "policy_loss": 0.012222936376929283, "critic_loss": 3.979320526123047, "episodic_reward": 169.0, "_wandb": {"runtime": 556}}

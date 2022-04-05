@@ -68,3 +68,38 @@ def tmp():
                 (nn.ReLU, {}),
                 (nn.Linear, {"in_features": 4, "out_features": output_dim})]
     
+#######################
+## OnPolicyMemory ##
+#######################
+
+
+def test_sample():
+    buffer = OnPolicyMemory()
+
+
+    ### TESTING ###
+
+    # check everything is the right shape and size
+    assert len(states) == agent.batch_size
+    assert len(actions) == agent.batch_size
+    assert log_probs.shape == (agent.batch_size,)
+    assert rewards.shape == (agent.batch_size,)
+    assert dones.shape == (agent.batch_size,)
+    assert next_states.shape == states.shape
+
+    assert states.device == torch.device(agent.device)
+    assert rewards.device == torch.device(agent.device)
+    assert dones.device == torch.device(agent.device)
+
+    assert torch.is_floating_point(states)
+    assert torch.is_floating_point(actions)
+    assert torch.is_floating_point(rewards)
+    assert torch.is_floating_point(dones)
+    assert torch.is_floating_point(next_states)
+    
+    assert len(epi_rewards) == torch.sum(dones)
+    assert isinstance(epi_rewards)
+
+    for i in range(len(states)):
+        assert agent.env.observation_space.contains(states[i].cpu().detach().numpy()), states[i].cpu().detach().numpy()
+        assert agent.env.observation_space.contains(next_states[i].cpu().detach().numpy()), next_states[i].cpu().detach().numpy()

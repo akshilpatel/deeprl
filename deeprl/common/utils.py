@@ -21,7 +21,7 @@ def get_gym_space_shape(space):
 
 
 
-def discount_cumsum(x, dones, gamma):
+def discount_cumsum(x, dones, discount):
     """
     ## from cleanrl ##
     computing discounted cumulative sums of vectors that resets with dones
@@ -39,8 +39,16 @@ def discount_cumsum(x, dones, gamma):
          x3 + discount * x4,
          x4]
     """
-    discount_cumsum = np.zeros_like(x)
-    discount_cumsum[-1] = x[-1]
+    assert len(x) > 0
+    assert len(dones) == len(x)
+
+    dones = dones.cpu().detach().numpy()
+    x = x.cpu().detach().numpy()
+
+    out = np.zeros_like(x)
+    out[-1] = x[-1]
+
+    # Iterate backward through time
     for t in reversed(range(x.shape[0]-1)):
-        discount_cumsum[t] = x[t] + gamma * discount_cumsum[t+1] * (1-dones[t])
-    return discount_cumsum
+        out[t] = x[t] + discount * out[t+1] * (1-dones[t])
+    return out

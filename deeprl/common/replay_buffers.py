@@ -18,13 +18,12 @@ class Memory:
 
     
     def to_torch(self, x):
-        return torch.tensor(x).to(self.device)
+        return torch.tensor(x).float().to(self.device)
 
 
     def reset_buffer(self):
         """Deletes contents of memory where the buffer lives"""
         self.buffer.clear()
-        assert len(self.buffer) == 0
 
     def sample(self, num_samples):
         """
@@ -47,7 +46,7 @@ class Memory:
         next_states = torch.tensor(next_states, dtype=torch.float, device=self.device)  # shape: (mb_size, state_dim)
         actions = torch.tensor(actions, dtype=torch.float, device=self.device)          # shape:(mb_size, action_dim) used for indexing only 
         rewards = torch.tensor([rewards], dtype=torch.float, device=self.device)        # shape (mb_size,) added to output
-        dones = torch.tensor(dones, dtype=torch.int, device=self.device)                # (mb_size, 1)
+        dones = torch.tensor(dones, dtype=torch.long, device=self.device)                # (mb_size, 1)
         
         return states, actions, rewards, dones, next_states
 
@@ -60,18 +59,21 @@ class OnPolicyMemory(Memory):
     """Version of memory where order matters
 
     Args:
-        Memory (object): Base memory class which
+        Memory (object): Base memory class which 
     """
     def __init__(self, max_len, device):
-        self.max_len = max_len
-        self.device = device
-        self.buffer = deque(maxlen=self.max_len)
+        super().__init__(max_len, device)
+        
+    def retrieve_experience(self):
+        """Convert buffer to ordered stacks of different components instead of rows of transitions and convert these to float tensors.
 
-    def sample(self):
-        out = tuple(zip(*self.buffer)))
+        Returns:
+            out (tuple[torch.Tensor]): recorded data as component stacks instead of rows of transitions. 
+        """
+        assert len(self.buffer) == self.max_len
+        out = tuple(map(self.to_torch, zip(*self.buffer)))        
         return out
     
-    def reset(self):
-        self.buffer.clear()
+
 
 
