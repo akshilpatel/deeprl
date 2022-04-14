@@ -1,4 +1,3 @@
-from cv2 import log
 import gym
 import numpy as np
 import torch
@@ -12,13 +11,33 @@ from typing import List, Tuple, Dict
 from deeprl.common.utils import net_gym_space_dims
 from deeprl.common.base import Network
 import multiprocessing as mp
-from torch.distributions import Categorical, Normal
+from deeprl.common.buffers import OnPolicyMemory
 from deeprl.common.base import CategoricalPolicy, GaussianPolicy
 
 import wandb
 
+
+import gym
+import numpy as np
+import torch
+from torch import nn, optim
+import matplotlib.pyplot as plt
+
+
+from typing import List, Tuple, Dict
+
+
+from deeprl.common.utils import net_gym_space_dims, discount_cumsum, to_torch
+from deeprl.common.base import Network
+import multiprocessing as mp
+from deeprl.common.buffers import OnPolicyMemory
+from deeprl.common.base import CategoricalPolicy, GaussianPolicy
+
+import wandb
+
+
 class A2C:
-    def __init__(self, args):     
+    def __init__(self, args):
         self.device = args["device"]
         self.gamma = args["gamma"]
         self.env = args["env"]
@@ -39,12 +58,24 @@ class A2C:
             self.policy.parameters(), self.policy_lr
         )
         self.entropy_coef = args["entropy_coef"]
-        # self.adv_n = 0.
-        # self.adv_mean = 0.
 
+        self.batch_size = args["batch_size"]
+        # self.minibatch_size = args["minibatch_size"]
+        self.num_train_passes = args["num_train_passes"]
+        self.lam = args["lam"]
+        self.gamma_lam = self.gamma * self.lam
+        self.entropy_coef = args["entropy_coef"]
+        self.num_eval_episodes = args["num_eval_episodes"]
 
-    def train(self, num_episodes:int, render=False, verbose=True) -> np.array:
-        """This is a wrapper method around the `run_episode` method. We use `train` mehod for running experiments. 
+        # Memory
+        self.buffer = OnPolicyMemory(self.batch_size, self.device)
+
+        self.current_epoch = 0
+        self.current_epi = 0
+        self.current_epi_reward = 0.0
+
+    def eval_run(self, num_episodes: int, render=False, verbose=True) -> np.array:
+        """This is a wrapper method around the `run_episode` method to run several episodes in evaluation.
 
         Args:
             num_episodes (int): The number of episodes for which to run training.
@@ -52,170 +83,202 @@ class A2C:
             verbose (bool, optional): Used to decide if we should . Defaults to True.
 
         Returns:
-            numpy array: Array of shape (num_episodes,) which contains the episodic rewards returned by the `run_episode` method. 
+            numpy array: Array of shape (num_episodes,) which contains the episodic rewards returned by the `run_episode` method.
         """
 
         total_rewards = np.zeros(num_episodes)
         for i in range(num_episodes):
-            total_rewards[i] = self.run_episode(render=render) 
+            total_rewards[i] = self.run_eval_episode(render=render)
 
-            if i%10==0 and verbose:
+            if i % 10 == 0 and verbose:
                 print("Episode {}, Reward {}".format(i, total_rewards[i]))
         return total_rewards
 
-    def run_episode(self, render=False):
+    def run_eval_episode(self, step_lim=np.inf, render=False):
         """Functionality for running an episode with updating.
 
         Args:
+            step_lim (int, optional): Maximum number of steps to limit each episode.
             render (bool, optional): Flag used to render episodes to watch training. Defaults to False. Defaults to False.
 
         Returns:
-            _type_: _description_
+            float: Reward accumulated during the episode.
         """
         state = self.env.reset()
-        episodic_reward = 0.
+        episodic_reward = 0.0
         step_counter = 0
-        while step_counter < self.step_lim:
-            
-            action, log_prob, entropy = self.choose_action(state)
+        while step_counter < step_lim:
+
+            action = self.choose_action(state)
             next_state, reward, done, _ = self.env.step(action)
 
-            episodic_reward += reward 
-            step_counter +=1
-            
-            if render: self.env.render()
-            
-            losses = self.update(state, reward, next_state, done, log_prob, entropy)
-            
-            if done: 
-                # print(losses)
+            episodic_reward += reward
+            step_counter += 1
+
+            if render:
+                self.env.render()
+
+            if done:
                 break
 
             state = next_state
 
-        wandb.log({"episodic_reward": episodic_reward})
         return episodic_reward
 
-    def update(self, state, reward, next_state, done:bool, log_prob, entropy):
-        """One step update which:
-        1) Converts the experience to tensors and puts on the correct device
-        2) Calls `.compute_adv_and_td_target` method to compute the advantage and td_target (without gradients) 
-        3) Calls the `update_policy` and `update_critic` methods using the advantage and td_target to update both policy and critic.
+    def run_eval(self, num_episodes: int = 10, step_lim=np.inf, render: bool = False):
+        self.policy.eval()
+        self.critic.eval()
+        epi_rewards = [
+            self.run_eval_episode(step_lim, render) for _ in range(num_episodes)
+        ]
+        self.policy.train()
+        self.critic.train()
+        return epi_rewards
+
+    def generate_experience(self):
+        """Interact with environment to produce rollout over multiple episodes if necessary.
+
+        Simulates agents interaction with gym env, stores as tuple (s, a, lp, r, d, ns)
+
 
         Args:
-            state (numpy array): State from which the agent starts the transition
-            reward (float or int): One step reward for the transition
-            next_state (numpy array): Next state after taking the action.
-            done (bool): True iff the next_state was terminal. 
-            log_prob (torch.FloatTensor): shape=(1,1)
-            entropy (torch.FloatTensor): shape=(1,1)
+            render (bool, optional): Whether or not to visualise the interaction. Defaults to False.
 
         Returns:
-            Tuple(float, float): (Policy Loss, Critic Loss) computed for the transition.
+            episodic_rewards (list): scalar rewards for each episode that the agent completes.
         """
+        self.current_epoch += 1
+        state = self.env.reset()
 
-        state = torch.tensor([state], dtype=torch.float, device=self.device)
-        next_state = torch.tensor([next_state], dtype=torch.float, device=self.device)
-        # done = torch.tensor(done, dtype=torch.int, device=self.device) # are these two lines needed since they don't go through a model.
-        # reward = torch.tensor(reward, dtype=torch.float, device=self.device)
+        self.current_epi += 1
 
-        # print(state, next_state, done, reward)
+        self.current_epi_reward = 0.0
+        step_counter = 0
+        batch_reward = 0.0
 
-        # These are both targets so no need to track grads
-        # with torch.no_grad():
-        adv, td_target = self.compute_adv_and_td_target(state, reward, next_state, done)
+        while step_counter < self.batch_size:
 
-        assert not adv.requires_grad
-        assert not td_target.requires_grad
+            action = self.choose_action(state)
+            next_state, reward, done, _ = self.env.step(action)
 
-        policy_loss = self.update_policy(log_prob, entropy, adv)
-        critic_loss = self.update_critic(td_target, state)
+            self.buffer.store((state, action, reward, done, next_state))
 
-        return policy_loss, critic_loss
+            batch_reward += reward
+            step_counter += 1
+            # wandb.log(
+            #     {"train_action": action},
+            #     step=step_counter,
+            # )
+            # Storage
 
-    def update_policy(self, log_prob, entropy, adv):
-        """Computes the policy loss and updates the policy network
+            if done:
+                state = self.env.reset()
+                # log train_episode_length
+            else:
+                state = next_state
 
-        Args:
-            log_prob (torch.tensor): Log probability of action taken by agent.
-            entropy (torch.tensor): Entropy value for transitions.
-            adv (torch.tensor): Advantage value for the transitions.
+        return batch_reward
 
-        Returns:
-            float: policy loss computed for transition.
-        """
-        assert not adv.requires_grad
-        assert log_prob.requires_grad
-        # print(log_prob)
-        # print(adv)
-        
-        policy_loss = -(log_prob * adv) - (entropy * self.entropy_coef)
-        # print(policy_loss, policy_loss.shape)
-        policy_loss = policy_loss.squeeze()
+    def update_critic(self, minibatch):
+        states = minibatch["states"]
+        v_targets = minibatch["v_targets"]
 
-        self.policy_optimiser.zero_grad()
-        policy_loss.backward()
-        # nn.utils.clip_grad_norm_(self.policy.parameters(), 0.2)
-        self.policy_optimiser.step()
-        wandb.log({"policy_loss": policy_loss.item()})
-        return policy_loss.item()
+        assert not v_targets.requires_grad
 
-    def update_critic(self, td_target, state):
-        """Used to compute loss and update for critic
+        v_preds = self.critic(states)
 
-        Args:
-            td_target (torch.tensor): r + gamma * V(next_state) * (1 - done)
-            state (torch.tensor): State in transition
+        critic_loss = self.critic_criterion(v_preds, v_targets)
 
-        Returns:
-            float: critic loss
-        """
-       
-
-        current_state_val = self.critic(state)
-        
-        critic_loss = self.critic_criterion(current_state_val, td_target)
-        
         self.critic_optimiser.zero_grad()
         critic_loss.backward()
-        
-        # nn.utils.clip_grad_norm_(self.critic.parameters(), 0.2)
+        # nn.utils.clip_grad_norm_(self.policy.parameters(), 1.0)
         self.critic_optimiser.step()
-
-        wandb.log({"critic_loss": critic_loss.item()})
-        
         return critic_loss.item()
 
     @torch.no_grad()
-    def compute_adv_and_td_target(self, state, reward, next_state, done):
+    def compute_td_deltas(self, batch):
+        states = batch["states"]
+        next_states = batch["next_states"]
+        rewards = batch["rewards"].unsqueeze(-1)
+        dones = batch["dones"].unsqueeze(-1)
+
+        first_state = states[0].unsqueeze(0)
+        first_state_value = self.critic(first_state)  # this state is never terminal
+
+        next_values = self.critic(next_states) * (1 - dones)
+        assert dones.shape == next_values.shape
+
+        all_values = torch.cat([first_state_value, next_values])
+        current_values = all_values[:-1]
+
+        assert rewards.shape == next_values.shape
+        assert current_values.shape == next_values.shape
+
+        deltas = rewards + (self.gamma * next_values) - current_values
+
+        assert deltas.dim() == 2, deltas.shape
+        assert deltas.shape[1] == 1
+
+        return deltas
+
+    def update_policy(self, minibatch):
+
+        advantages = minibatch["advantages"]
+        states = minibatch["states"]
+        actions = minibatch["actions"]
+
+        log_probs, entropies = self.get_log_probs_and_entropies(states, actions)
+
+        policy_loss = -advantages * log_probs - entropies * self.entropy_coef
+        policy_loss = policy_loss.mean()
+
+        self.policy_optimiser.zero_grad()
+        policy_loss.backward()
+        # nn.utils.clip_grad_norm_(self.policy.parameters(), 1.0)
+        self.policy_optimiser.step()
+
+        return policy_loss.item()
+
+    @torch.no_grad()
+    def compute_gae_and_v_targets(self, batch):
         """
-        Computes the td_target and advantage for policy and critic updates. No gradients are tracked.
-        
+        Computes the v_targets and advantages for policy and critic updates. No gradients are tracked.
+        Advantages are computed using GAE.
+
         Args:
-            state (torch tensor, float, (1, state_dim)): current state
-            next_state (torch tensor, float, (1, state_dim)): next state
-            reward (float): one-step reward
-            done (boole): true iff next_state of the transition was terminal
+            states (torch tensor, float, (1, state_dim)): current state
+            next_states (torch tensor, float, (1, state_dim)): next state
+            rewards (float): one-step reward
+            dones (boole): true iff next_state of the transition was terminal
 
         Returns:
-            advantage (torch tensor, float, (1, 1)): td_target - V(s)
-            td_target (torch tensor, float, (1, 1)): r + gamma * V(s') * (1-done)
+            advantages (torch tensor, float, (batch_size, 1)): Using GAE
+            v_targets (torch tensor, float, (batch_size, 1)): adv + v(s)
         """
-        
-        td_target = reward + self.gamma * self.critic(next_state) * (1-done)
-        adv = td_target - self.critic(state)
-        
-        assert not td_target.requires_grad
-        assert not adv.requires_grad
-        assert adv.shape == (1,1)
-        assert td_target.shape == (1,1)
-        
-        wandb.log({"advantage": adv.item()})
-        wandb.log({"td_target": td_target.item()})
+        td_deltas = self.compute_td_deltas(batch)
 
-        return adv, td_target
+        advantages = discount_cumsum(td_deltas, batch["dones"], self.gamma_lam)
+        advantages = torch.from_numpy(advantages).to(self.device)
 
-    
+        state_values = self.critic(
+            batch["states"]
+        )  # States are all those from which an action is taken (hence non-terminal).
+
+        print(advantages.shape, state_values.shape)
+        v_targets = advantages + state_values
+
+        assert not td_deltas.requires_grad
+        assert not advantages.requires_grad
+        assert advantages.shape == (len(batch["states"]), 1)
+        assert v_targets.shape == (len(batch["states"]), 1)
+
+        # TODO: Change this to use a standardiser transform.
+        advantages -= advantages.mean()
+        advantages /= advantages.std()
+
+        return advantages, v_targets
+
+    # @torch.no_grad()
     def choose_action(self, state):
         """Calls the policy network to sample an action for a given state. The log_prob of the action and the entropy of the distribution are also recorded for updates.
 
@@ -224,20 +287,49 @@ class A2C:
 
         Returns:
             numpy array (gym action_dim): action selected
-            torch float tensor (1, 1): log probability of policy distribution used to sample the action
-            torch float tensor (1, 1): entropy of policy distribution used to sample the action
-        """ 
-        state = torch.tensor([state], dtype=torch.float, device=self.device)
-        action, log_prob, entropy = self.policy.sample(state)
+        """
+        state = torch.tensor(state, dtype=torch.float, device=self.device).unsqueeze(0)
+        action = self.policy.get_action(state)
 
         action = action.cpu().detach().numpy().squeeze()
-        
+
         assert self.env.action_space.contains(action)
-        wandb.log({"lp": log_prob.item()})
-        wandb.log({"entropy": entropy.item()})
 
-        return action, log_prob, entropy
+        return action
 
+    def get_log_probs_and_entropies(self, states, actions):
+
+        states = torch.tensor(states, dtype=torch.float, device=self.device)
+        actions = torch.tensor(actions, dtype=torch.float, device=self.device)
+
+        log_probs = self.policy.get_log_prob(states, actions).unsqueeze(-1)
+        entropies = self.policy.get_entropy(states).unsqueeze(-1)
+
+        assert log_probs.requires_grad
+        assert entropies.requires_grad
+
+        assert log_probs.shape == (len(states), 1)
+        assert entropies.shape == (len(states), 1)
+
+        return log_probs, entropies
+
+    def train_one_epoch(self):
+        self.generate_experience(self.batch_size)
+        batch = self.buffer.sample(batch)
+        advantages, v_targets = self.compute_gae_and_v_targets(batch)
+        batch["advantages"], batch["v_targets"] = advantages, v_targets
+
+        policy_loss = self.update_policy(batch)
+        critic_loss = self.update_critic(batch)
+
+        eval_log = self.run_eval(
+            self.num_eval_episodes, step_lim=self.step_lim, render=False
+        )
+        return policy_loss, critic_loss, eval_log
+
+    def run_experiment(num_epochs):
+        for _ in range(num_epochs):
+            p_loss, c_loss, eval_log = self.train_one_epoch()
 
 
 if __name__ == "__main__":
@@ -247,23 +339,32 @@ if __name__ == "__main__":
     env = gym.make(ENVNAME)
 
     policy_layers = [
-        (nn.Linear,
-            {"in_features": net_gym_space_dims(env.observation_space),
-            "out_features": 32}),
+        (
+            nn.Linear,
+            {
+                "in_features": net_gym_space_dims(env.observation_space),
+                "out_features": 32,
+            },
+        ),
         (nn.Tanh, {}),
-        (nn.Linear,
-            {"in_features": 32,
-            "out_features": 32}),
+        (nn.Linear, {"in_features": 32, "out_features": 32}),
         (nn.Tanh, {}),
-        (nn.Linear,{"in_features": 32, "out_features": net_gym_space_dims(env.action_space)}),
+        (
+            nn.Linear,
+            {"in_features": 32, "out_features": net_gym_space_dims(env.action_space)},
+        ),
     ]
 
     critic_layers = [
-        (nn.Linear, {"in_features": net_gym_space_dims(env.observation_space), "out_features": 32}),
+        (
+            nn.Linear,
+            {
+                "in_features": net_gym_space_dims(env.observation_space),
+                "out_features": 32,
+            },
+        ),
         (nn.ReLU, {}),
-        (nn.Linear,
-            {"in_features": 32,
-            "out_features": 32}),
+        (nn.Linear, {"in_features": 32, "out_features": 32}),
         (nn.ReLU, {}),
         (nn.Linear, {"in_features": 32, "out_features": 1}),
     ]
@@ -281,6 +382,7 @@ if __name__ == "__main__":
         "critic_criterion": nn.MSELoss(),
         "device": "cuda",
         "entropy_coef": 0.01,
+        "batch_size": 30,
     }
 
     num_agents = 5
@@ -296,15 +398,15 @@ if __name__ == "__main__":
         "entropy_coef": a2c_args["entropy_coef"],
         "step_lim": a2c_args["step_lim"],
         "policy_lr": a2c_args["policy_lr"],
-        "critic_lr": a2c_args["critic_lr"], 
+        "critic_lr": a2c_args["critic_lr"],
         "num_agents": num_agents,
-        "num_episodes": num_epi}
-        
+        "num_episodes": num_epi,
+    }
 
     for i in range(num_agents):
         print("Running training for agent number {}".format(i))
         agent = A2C(a2c_args)
-            
+
         # random.seed(i)
         # np.random.seed(i)
         # torch.manual_seed(i)
@@ -315,10 +417,10 @@ if __name__ == "__main__":
     out = np.array(r).mean(0)
 
     plt.figure(figsize=(5, 3))
-    plt.title('A2C on cartpole')
-    plt.xlabel('Episode')
-    plt.ylabel('Episodic Reward')
-    plt.plot(out, label='rewards')
+    plt.title("A2C on cartpole")
+    plt.xlabel("Episode")
+    plt.ylabel("Episodic Reward")
+    plt.plot(out, label="rewards")
     plt.legend()
 
     # plt.savefig('./data/a2c_cartpole.PNG')
