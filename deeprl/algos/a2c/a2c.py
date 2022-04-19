@@ -74,26 +74,6 @@ class A2C:
         self.current_epi = 0
         self.current_epi_reward = 0.0
 
-    def eval_run(self, num_episodes: int, render=False, verbose=True) -> np.array:
-        """This is a wrapper method around the `run_episode` method to run several episodes in evaluation.
-
-        Args:
-            num_episodes (int): The number of episodes for which to run training.
-            render (bool, optional): Flag used to render episodes to watch training. Defaults to False.
-            verbose (bool, optional): Used to decide if we should . Defaults to True.
-
-        Returns:
-            numpy array: Array of shape (num_episodes,) which contains the episodic rewards returned by the `run_episode` method.
-        """
-
-        total_rewards = np.zeros(num_episodes)
-        for i in range(num_episodes):
-            total_rewards[i] = self.run_eval_episode(render=render)
-
-            if i % 10 == 0 and verbose:
-                print("Episode {}, Reward {}".format(i, total_rewards[i]))
-        return total_rewards
-
     def run_eval_episode(self, step_lim=np.inf, render=False):
         """Functionality for running an episode with updating.
 
@@ -126,6 +106,16 @@ class A2C:
         return episodic_reward
 
     def run_eval(self, num_episodes: int = 10, step_lim=np.inf, render: bool = False):
+        """This is a wrapper method around the `run_episode` method to run several episodes in evaluation.
+
+        Args:
+            num_episodes (int): The number of episodes for which to run training.
+            render (bool, optional): Flag used to render episodes to watch training. Defaults to False.
+            verbose (bool, optional): Used to decide if we should . Defaults to True.
+
+        Returns:
+            numpy array: Array of shape (num_episodes,) which contains the episodic rewards returned by the `run_episode` method.
+        """
         self.policy.eval()
         self.critic.eval()
         epi_rewards = [
@@ -191,7 +181,7 @@ class A2C:
 
         self.critic_optimiser.zero_grad()
         critic_loss.backward()
-        # nn.utils.clip_grad_norm_(self.policy.parameters(), 1.0)
+        nn.utils.clip_grad_norm_(self.critic.parameters(), 0.5)
         self.critic_optimiser.step()
         return critic_loss.item()
 
@@ -230,14 +220,15 @@ class A2C:
         log_probs, entropies = self.get_log_probs_and_entropies(states, actions)
 
         policy_loss = -advantages * log_probs - entropies * self.entropy_coef
+        policy_loss_std = policy_loss.detach().std()
         policy_loss = policy_loss.mean()
 
         self.policy_optimiser.zero_grad()
         policy_loss.backward()
-        # nn.utils.clip_grad_norm_(self.policy.parameters(), 1.0)
+        nn.utils.clip_grad_norm_(self.policy.parameters(), 0.5)
         self.policy_optimiser.step()
 
-        return policy_loss.item()
+        return policy_loss.item(), policy_loss_std.item()
 
     @torch.no_grad()
     def compute_gae_and_v_targets(self, batch):
@@ -264,7 +255,6 @@ class A2C:
             batch["states"]
         )  # States are all those from which an action is taken (hence non-terminal).
 
-        print(advantages.shape, state_values.shape)
         v_targets = advantages + state_values
 
         assert not td_deltas.requires_grad
@@ -274,7 +264,7 @@ class A2C:
 
         # TODO: Change this to use a standardiser transform.
         advantages -= advantages.mean()
-        advantages /= advantages.std()
+        advantages /= advantages.std() + 1e-8
 
         return advantages, v_targets
 
@@ -299,9 +289,6 @@ class A2C:
 
     def get_log_probs_and_entropies(self, states, actions):
 
-        states = torch.tensor(states, dtype=torch.float, device=self.device)
-        actions = torch.tensor(actions, dtype=torch.float, device=self.device)
-
         log_probs = self.policy.get_log_prob(states, actions).unsqueeze(-1)
         entropies = self.policy.get_entropy(states).unsqueeze(-1)
 
@@ -313,9 +300,9 @@ class A2C:
 
         return log_probs, entropies
 
-    def train_one_epoch(self):
-        self.generate_experience(self.batch_size)
-        batch = self.buffer.sample(batch)
+    def train_one_epoch(self, render_eval=False):
+        self.generate_experience()
+        batch = self.buffer.sample_batch()
         advantages, v_targets = self.compute_gae_and_v_targets(batch)
         batch["advantages"], batch["v_targets"] = advantages, v_targets
 
@@ -323,13 +310,25 @@ class A2C:
         critic_loss = self.update_critic(batch)
 
         eval_log = self.run_eval(
-            self.num_eval_episodes, step_lim=self.step_lim, render=False
+            self.num_eval_episodes, step_lim=self.step_lim, render=render_eval
         )
         return policy_loss, critic_loss, eval_log
 
-    def run_experiment(num_epochs):
-        for _ in range(num_epochs):
+    def run_experiment(self, num_epochs):
+        p_losses = np.zeros(num_epochs)
+        c_losses = np.zeros(num_epochs)
+        rewards = np.zeros(num_epochs)
+        for i in range(num_epochs):
             p_loss, c_loss, eval_log = self.train_one_epoch()
+            print(
+                "After epoch {}, policy loss={}, critic loss={}, average reward earned={}".format(
+                    i, p_loss, c_loss, np.mean(eval_log)
+                )
+            )
+            p_losses[i] = p_loss
+            c_losses[i] = c_loss
+            rewards[i] = np.mean(eval_log)
+        return p_losses, c_losses, rewards
 
 
 if __name__ == "__main__":
