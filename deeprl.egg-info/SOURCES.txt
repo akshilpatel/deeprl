@@ -10,6 +10,8 @@ deeprl.egg-info/top_level.txt
 deeprl/algos/__init__.py
 deeprl/algos/a2c/__init__.py
 deeprl/algos/a2c/a2c.py
+deeprl/algos/a3c/__init__.py
+deeprl/algos/a3c/a3c.py
 deeprl/algos/dqn/__init__.py
 deeprl/algos/dqn/dqn.py
 deeprl/algos/ppo/__init__.py
@@ -18,8 +20,10 @@ deeprl/algos/vpg/__init__.py
 deeprl/algos/vpg/vpg.py
 deeprl/common/__init__.py
 deeprl/common/base.py
-deeprl/common/replay_buffers.py
+deeprl/common/buffers.py
 deeprl/common/utils.py
+deeprl/common/parallel_sampling/__init__.py
+deeprl/common/parallel_sampling/optimisers.py
 tests/__init__.py
 tests/test_a2c.py
 tests/test_base.py

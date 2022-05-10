@@ -1,47 +1,39 @@
+from collections import defaultdict
+from email.policy import default
+from multiprocessing.sharedctypes import Value
 import gym
 import numpy as np
 import torch
 from torch import nn, optim
+import torch.multiprocessing as mp
 import matplotlib.pyplot as plt
 
 
 from typing import List, Tuple, Dict
 
 
-from deeprl.common.utils import net_gym_space_dims
+from deeprl.common.utils import (
+    net_gym_space_dims,
+    discount_cumsum,
+    process_batch,
+    compute_gae_and_v_targets,
+    compute_td_deltas,
+)
 from deeprl.common.base import Network
-import multiprocessing as mp
-from deeprl.common.buffers import OnPolicyMemory
 from deeprl.common.base import CategoricalPolicy, GaussianPolicy
-
-import wandb
-
-
-import gym
-import numpy as np
-import torch
-from torch import nn, optim
-import matplotlib.pyplot as plt
-
-
-from typing import List, Tuple, Dict
-
-
-from deeprl.common.utils import net_gym_space_dims, discount_cumsum, to_torch
-from deeprl.common.base import Network
-import multiprocessing as mp
-from deeprl.common.buffers import OnPolicyMemory
-from deeprl.common.base import CategoricalPolicy, GaussianPolicy
-
-import wandb
 
 
 class A2C:
     def __init__(self, args):
         self.device = args["device"]
+
         self.gamma = args["gamma"]
-        self.env = args["env"]
+        self.lam = args["lam"]
+        self.gamma_lam = self.gamma * self.lam
+
+        self.env_name = args["env_name"]
         self.step_lim = args["step_lim"]
+        self.num_workers = args["num_workers"]
 
         # Critic
         self.critic = args["critic"].to(self.device)
@@ -60,19 +52,19 @@ class A2C:
         self.entropy_coef = args["entropy_coef"]
 
         self.batch_size = args["batch_size"]
-        # self.minibatch_size = args["minibatch_size"]
+        self.minibatch_size = args["minibatch_size"]
+
+        assert (
+            self.batch_size % self.minibatch_size == 0
+        ), "Minibatch_size does not divide batch_size"
+
         self.num_train_passes = args["num_train_passes"]
-        self.lam = args["lam"]
-        self.gamma_lam = self.gamma * self.lam
+        self.norm_adv = args["norm_adv"]
+
         self.entropy_coef = args["entropy_coef"]
         self.num_eval_episodes = args["num_eval_episodes"]
 
-        # Memory
-        self.buffer = OnPolicyMemory(self.batch_size, self.device)
-
         self.current_epoch = 0
-        self.current_epi = 0
-        self.current_epi_reward = 0.0
 
     def run_eval_episode(self, step_lim=np.inf, render=False):
         """Functionality for running an episode with updating.
@@ -84,25 +76,29 @@ class A2C:
         Returns:
             float: Reward accumulated during the episode.
         """
-        state = self.env.reset()
+        env2 = gym.make(self.env_name)
+        state = env2.reset()
+
         episodic_reward = 0.0
         step_counter = 0
         while step_counter < step_lim:
 
-            action = self.choose_action(state)
-            next_state, reward, done, _ = self.env.step(action)
+            action = self.choose_action(np.expand_dims(state, 0))
+
+            next_state, reward, done, _ = env2.step(action)
 
             episodic_reward += reward
             step_counter += 1
 
             if render:
-                self.env.render()
+                env2.render()
 
             if done:
                 break
 
             state = next_state
 
+        env2.close()
         return episodic_reward
 
     def run_eval(self, num_episodes: int = 10, step_lim=np.inf, render: bool = False):
@@ -125,50 +121,6 @@ class A2C:
         self.critic.train()
         return epi_rewards
 
-    def generate_experience(self):
-        """Interact with environment to produce rollout over multiple episodes if necessary.
-
-        Simulates agents interaction with gym env, stores as tuple (s, a, lp, r, d, ns)
-
-
-        Args:
-            render (bool, optional): Whether or not to visualise the interaction. Defaults to False.
-
-        Returns:
-            episodic_rewards (list): scalar rewards for each episode that the agent completes.
-        """
-        self.current_epoch += 1
-        state = self.env.reset()
-
-        self.current_epi += 1
-
-        self.current_epi_reward = 0.0
-        step_counter = 0
-        batch_reward = 0.0
-
-        while step_counter < self.batch_size:
-
-            action = self.choose_action(state)
-            next_state, reward, done, _ = self.env.step(action)
-
-            self.buffer.store((state, action, reward, done, next_state))
-
-            batch_reward += reward
-            step_counter += 1
-            # wandb.log(
-            #     {"train_action": action},
-            #     step=step_counter,
-            # )
-            # Storage
-
-            if done:
-                state = self.env.reset()
-                # log train_episode_length
-            else:
-                state = next_state
-
-        return batch_reward
-
     def update_critic(self, minibatch):
         states = minibatch["states"]
         v_targets = minibatch["v_targets"]
@@ -178,12 +130,13 @@ class A2C:
         v_preds = self.critic(states)
 
         critic_loss = self.critic_criterion(v_preds, v_targets)
+        critic_loss_std = critic_loss.detach().std()  # For logging
 
         self.critic_optimiser.zero_grad()
         critic_loss.backward()
         nn.utils.clip_grad_norm_(self.critic.parameters(), 0.5)
         self.critic_optimiser.step()
-        return critic_loss.item()
+        return critic_loss.item(), critic_loss_std.item()
 
     @torch.no_grad()
     def compute_td_deltas(self, batch):
@@ -193,6 +146,7 @@ class A2C:
         dones = batch["dones"].unsqueeze(-1)
 
         first_state = states[0].unsqueeze(0)
+
         first_state_value = self.critic(first_state)  # this state is never terminal
 
         next_values = self.critic(next_states) * (1 - dones)
@@ -278,12 +232,13 @@ class A2C:
         Returns:
             numpy array (gym action_dim): action selected
         """
-        state = torch.tensor(state, dtype=torch.float, device=self.device).unsqueeze(0)
+
+        state = torch.tensor(state, dtype=torch.float, device=self.device)
+
+        if self.num_workers == 1:
+            state = state.unsqueeze(0)
+
         action = self.policy.get_action(state)
-
-        action = action.cpu().detach().numpy().squeeze()
-
-        assert self.env.action_space.contains(action)
 
         return action
 
@@ -301,41 +256,88 @@ class A2C:
         return log_probs, entropies
 
     def train_one_epoch(self, render_eval=False):
-        self.generate_experience()
-        batch = self.buffer.sample_batch()
+        batch = self.parallel_gen_experience()
         advantages, v_targets = self.compute_gae_and_v_targets(batch)
         batch["advantages"], batch["v_targets"] = advantages, v_targets
 
-        policy_loss = self.update_policy(batch)
-        critic_loss = self.update_critic(batch)
+        policy_loss, policy_loss_std = self.update_policy(batch)
+        critic_loss, critic_loss_std = self.update_critic(batch)
 
         eval_log = self.run_eval(
             self.num_eval_episodes, step_lim=self.step_lim, render=render_eval
         )
-        return policy_loss, critic_loss, eval_log
+        return (policy_loss, policy_loss_std, critic_loss, critic_loss_std), eval_log
 
-    def run_experiment(self, num_epochs):
-        p_losses = np.zeros(num_epochs)
-        c_losses = np.zeros(num_epochs)
-        rewards = np.zeros(num_epochs)
-        for i in range(num_epochs):
-            p_loss, c_loss, eval_log = self.train_one_epoch()
-            print(
-                "After epoch {}, policy loss={}, critic loss={}, average reward earned={}".format(
-                    i, p_loss, c_loss, np.mean(eval_log)
-                )
-            )
-            p_losses[i] = p_loss
-            c_losses[i] = c_loss
-            rewards[i] = np.mean(eval_log)
-        return p_losses, c_losses, rewards
+    def parallel_gen_experience(self):
+        args = list(enumerate(self.envs))
+        out_dict = [{} for _ in range(self.num_workers)]
+        with mp.Pool(self.num_workers) as pool:
+            out = pool.starmap(self.generate_experience, args)
+
+        self.current_epoch += 1
+        for (id, transitions, env) in out:
+            out_dict[id]["transitions"] = transitions
+            out_dict[id]["env"] = env
+        return out_dict
+
+    def generate_experience(self, id, env):
+        """Interact with environment to produce rollout over multiple episodes if necessary.
+
+        Simulates agents interaction with gym env, stores as tuple (s, a, lp, r, d, ns)
+
+
+        Args:
+            render (bool, optional): Whether or not to visualise the interaction. Defaults to False.
+
+        Returns:
+            episodic_rewards (list): scalar rewards for each episode that the agent completes.
+        """
+        # if id != None:
+        #     torch.seed(id)
+        #     np.random.seed(id)
+        #     gym.seed(id)
+
+        state = env.state
+
+        step_counter = 0
+        batch_reward = 0.0
+
+        transitions = [None for _ in range(self.batch_size)]
+
+        while step_counter < self.batch_size:
+
+            action = self.choose_action(state)
+            next_state, reward, done, _ = env.step(action)
+
+            # self.buffer.store((state, action, reward, done, next_state))
+            transitions[step_counter] = (state, action, reward, done, next_state)
+
+            batch_reward += reward
+            step_counter += 1
+            # wandb.log(
+            #     {"train_action": action},
+            #     step=step_counter,
+            # )
+            # Storage
+
+            if done:
+                state = env.reset()
+                # log train_episode_length
+            else:
+                state = next_state
+
+        return (
+            id,
+            transitions,
+            env,
+        )
 
 
 if __name__ == "__main__":
 
-    ENVNAME = "CartPole-v1"
+    env_name = "CartPole-v1"
 
-    env = gym.make(ENVNAME)
+    env = gym.make(env_name)
 
     policy_layers = [
         (
@@ -370,57 +372,63 @@ if __name__ == "__main__":
 
     a2c_args = {
         "gamma": 0.99,
-        "env": env,
+        "env_name": env_name,
         "step_lim": 200,
         "policy": CategoricalPolicy(policy_layers),
         "policy_optimiser": optim.Adam,
-        "policy_lr": 0.001,
+        "policy_lr": 0.002,
         "critic": Network(critic_layers),
-        "critic_lr": 0.001,
+        "critic_lr": 0.002,
         "critic_optimiser": optim.Adam,
         "critic_criterion": nn.MSELoss(),
-        "device": "cuda",
+        "device": "cpu",
         "entropy_coef": 0.01,
-        "batch_size": 30,
+        "batch_size": 300,
+        "num_train_passes": 1,
+        "lam": 0.95,
+        "num_eval_episodes": 15,
+        "num_workers": mp.cpu_count() - 1,
     }
 
-    num_agents = 5
-    num_epi = 200
-    r = []
+    agent = A2C(a2c_args)
+    experience = agent.parallel_gen_experience()
+    print(experience[""])
 
-    wandb.init(project="deeprl", name="a2c-cartpole", entity="akshil")
-    wandb.config = {
-        "environment": ENVNAME,
-        "policy_layers": policy_layers,
-        "critic_layers": critic_layers,
-        "gamma": a2c_args["gamma"],
-        "entropy_coef": a2c_args["entropy_coef"],
-        "step_lim": a2c_args["step_lim"],
-        "policy_lr": a2c_args["policy_lr"],
-        "critic_lr": a2c_args["critic_lr"],
-        "num_agents": num_agents,
-        "num_episodes": num_epi,
-    }
+    # wandb.init(project="deeprl", name="a2c-cartpole", entity="akshil")
+    # wandb.config = {
+    #     "environment": env_name,
+    #     "policy_layers": policy_layers,
+    #     "critic_layers": critic_layers,
+    #     "gamma": a2c_args["gamma"],
+    #     "entropy_coef": a2c_args["entropy_coef"],
+    #     "step_lim": a2c_args["step_lim"],
+    #     "policy_lr": a2c_args["policy_lr"],
+    #     "critic_lr": a2c_args["critic_lr"],
+    #     "num_agents": num_agents,
+    #     "num_episodes": num_epi,
+    # }
+    # num_agents = 5
+    # num_epi = 200
+    # r = []
+    # for i in range(2):
+    #     print("Running training for agent number {}".format(i))
+    #     agent = A2C(a2c_args)
 
-    for i in range(num_agents):
-        print("Running training for agent number {}".format(i))
-        agent = A2C(a2c_args)
+    #     # random.seed(i)
+    #     # np.random.seed(i)
+    #     # torch.manual_seed(i)
+    #     # env.seed(i)
 
-        # random.seed(i)
-        # np.random.seed(i)
-        # torch.manual_seed(i)
-        # env.seed(i)
+    #     r.append(agent.train(num_epi))
 
-        r.append(agent.train(num_epi))
+    # out = np.array(r).mean(0)
 
-    out = np.array(r).mean(0)
+    # plt.figure(figsize=(5, 3))
+    # plt.title("A2C on cartpole")
+    # plt.xlabel("Episode")
+    # plt.ylabel("Episodic Reward")
+    # plt.plot(out, label="rewards")
+    # plt.legend()
 
-    plt.figure(figsize=(5, 3))
-    plt.title("A2C on cartpole")
-    plt.xlabel("Episode")
-    plt.ylabel("Episodic Reward")
-    plt.plot(out, label="rewards")
-    plt.legend()
-
-    # plt.savefig('./data/a2c_cartpole.PNG')
-    plt.show()
+    # # plt.savefig('./data/a2c_cartpole.PNG')
+    # plt.show()

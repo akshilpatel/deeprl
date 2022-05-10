@@ -34,6 +34,7 @@ class Policy(Network):
     def get_action(self, state):
         prob_dist = self.forward(state)
         action = prob_dist.sample()
+        action = action.cpu().detach().numpy().squeeze()
         return action
 
     def get_log_prob(self, states, actions):
@@ -58,9 +59,6 @@ class CategoricalPolicy(Policy):
         super().__init__(arch)
 
     def forward(self, state):
-        # if not torch.is_tensor(state):
-        #     state = torch.from_numpy(state.astype(np.float32))
-        #     state = state.to(self.net.device)
 
         params = super().forward(state)
 
@@ -81,7 +79,7 @@ class CategoricalPolicy(Policy):
         return action, log_prob, entropy
 
 
-class GaussianPolicy(Network):
+class GaussianPolicy(Policy):
     def __init__(self, arch, action_space):
         super().__init__(arch)
         self.action_dim = net_gym_space_dims(action_space)
@@ -165,3 +163,7 @@ class MultiGaussianPolicy(GaussianPolicy):
         entropy = prob_dist.entropy()
 
         return action, log_prob, entropy
+
+
+class DeterministicPolicy(GaussianPolicy):
+    pass

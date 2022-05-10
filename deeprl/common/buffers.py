@@ -21,11 +21,6 @@ class Memory:
     def __len__(self):
         return len(self.buffer)
 
-    # def to_torch(self, x):
-    #     arr_x = np.array(x).astype(np.float32)
-    #     out = torch.from_numpy(arr_x).to(self.device)
-    #     return out
-
     def reset_buffer(self):
         """Deletes contents of memory where the buffer lives"""
         self.buffer.clear()
@@ -92,3 +87,19 @@ class OnPolicyMemory(Memory):
         }
 
         return batch
+
+    @staticmethod
+    def batch_to_minibatches(batch, num_minibatches):
+
+        batch_size = len(batch["states"])
+        assert batch // num_minibatches == 0
+        mb_size = batch_size // num_minibatches
+        mb_starts = np.arange(0, batch_size, mb_size)
+
+        indices = np.arange(batch_size)
+        np.random.shuffle(indices)
+
+        mb_idc = [indices[i : i + mb_size] for i in mb_starts]
+
+        # TODO: convert batches to minibatches using indices (look at slm-lab)
+        pass
