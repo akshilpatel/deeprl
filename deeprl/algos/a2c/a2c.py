@@ -1,13 +1,10 @@
-from collections import defaultdict
-from email.policy import default
-from multiprocessing.sharedctypes import Value
 import gym
 import numpy as np
 import torch
 from torch import nn, optim
-import torch.multiprocessing as mp
 import matplotlib.pyplot as plt
-
+from copy import deepcopy
+import torch.multiprocessing as mp
 
 from typing import List, Tuple, Dict
 
@@ -15,9 +12,11 @@ from typing import List, Tuple, Dict
 from deeprl.common.utils import (
     net_gym_space_dims,
     discount_cumsum,
-    process_batch,
     compute_gae_and_v_targets,
-    compute_td_deltas,
+    to_torch,
+    minibatch_split,
+    normalise_adv,
+    init_envs,
 )
 from deeprl.common.base import Network
 from deeprl.common.base import CategoricalPolicy, GaussianPolicy
@@ -51,20 +50,22 @@ class A2C:
         )
         self.entropy_coef = args["entropy_coef"]
 
-        self.batch_size = args["batch_size"]
+        self.n_interactions = args["n_interactions"]
         self.minibatch_size = args["minibatch_size"]
 
         assert (
-            self.batch_size % self.minibatch_size == 0
-        ), "Minibatch_size does not divide batch_size"
+            self.num_workers * self.n_interactions
+        ) % self.minibatch_size == 0, "Minibatch_size does not divide batch_size"
 
         self.num_train_passes = args["num_train_passes"]
         self.norm_adv = args["norm_adv"]
 
         self.entropy_coef = args["entropy_coef"]
         self.num_eval_episodes = args["num_eval_episodes"]
-
+        self.multiprocess = args["multiprocess"]
         self.current_epoch = 0
+
+        self.envs = init_envs(self.env_name, self.num_workers, self.multiprocess)
 
     def run_eval_episode(self, step_lim=np.inf, render=False):
         """Functionality for running an episode with updating.
@@ -76,8 +77,8 @@ class A2C:
         Returns:
             float: Reward accumulated during the episode.
         """
-        env2 = gym.make(self.env_name)
-        state = env2.reset()
+        env = gym.make(self.env_name)
+        state = env.reset()
 
         episodic_reward = 0.0
         step_counter = 0
@@ -85,20 +86,20 @@ class A2C:
 
             action = self.choose_action(np.expand_dims(state, 0))
 
-            next_state, reward, done, _ = env2.step(action)
+            next_state, reward, done, _ = env.step(action)
 
             episodic_reward += reward
             step_counter += 1
 
             if render:
-                env2.render()
+                env.render()
 
             if done:
                 break
 
             state = next_state
 
-        env2.close()
+        env.close()
         return episodic_reward
 
     def run_eval(self, num_episodes: int = 10, step_lim=np.inf, render: bool = False):
@@ -114,9 +115,13 @@ class A2C:
         """
         self.policy.eval()
         self.critic.eval()
+        # with mp.Pool(self.num_workers) as pool:
+        #     epi_rewards = pool.map(self.run_eval_episode, (step_lim, render))
+
         epi_rewards = [
             self.run_eval_episode(step_lim, render) for _ in range(num_episodes)
         ]
+
         self.policy.train()
         self.critic.train()
         return epi_rewards
@@ -138,40 +143,13 @@ class A2C:
         self.critic_optimiser.step()
         return critic_loss.item(), critic_loss_std.item()
 
-    @torch.no_grad()
-    def compute_td_deltas(self, batch):
-        states = batch["states"]
-        next_states = batch["next_states"]
-        rewards = batch["rewards"].unsqueeze(-1)
-        dones = batch["dones"].unsqueeze(-1)
-
-        first_state = states[0].unsqueeze(0)
-
-        first_state_value = self.critic(first_state)  # this state is never terminal
-
-        next_values = self.critic(next_states) * (1 - dones)
-        assert dones.shape == next_values.shape
-
-        all_values = torch.cat([first_state_value, next_values])
-        current_values = all_values[:-1]
-
-        assert rewards.shape == next_values.shape
-        assert current_values.shape == next_values.shape
-
-        deltas = rewards + (self.gamma * next_values) - current_values
-
-        assert deltas.dim() == 2, deltas.shape
-        assert deltas.shape[1] == 1
-
-        return deltas
-
     def update_policy(self, minibatch):
 
         advantages = minibatch["advantages"]
         states = minibatch["states"]
         actions = minibatch["actions"]
 
-        log_probs, entropies = self.get_log_probs_and_entropies(states, actions)
+        log_probs, entropies = self.policy.get_log_probs_and_entropies(states, actions)
 
         policy_loss = -advantages * log_probs - entropies * self.entropy_coef
         policy_loss_std = policy_loss.detach().std()
@@ -183,44 +161,6 @@ class A2C:
         self.policy_optimiser.step()
 
         return policy_loss.item(), policy_loss_std.item()
-
-    @torch.no_grad()
-    def compute_gae_and_v_targets(self, batch):
-        """
-        Computes the v_targets and advantages for policy and critic updates. No gradients are tracked.
-        Advantages are computed using GAE.
-
-        Args:
-            states (torch tensor, float, (1, state_dim)): current state
-            next_states (torch tensor, float, (1, state_dim)): next state
-            rewards (float): one-step reward
-            dones (boole): true iff next_state of the transition was terminal
-
-        Returns:
-            advantages (torch tensor, float, (batch_size, 1)): Using GAE
-            v_targets (torch tensor, float, (batch_size, 1)): adv + v(s)
-        """
-        td_deltas = self.compute_td_deltas(batch)
-
-        advantages = discount_cumsum(td_deltas, batch["dones"], self.gamma_lam)
-        advantages = torch.from_numpy(advantages).to(self.device)
-
-        state_values = self.critic(
-            batch["states"]
-        )  # States are all those from which an action is taken (hence non-terminal).
-
-        v_targets = advantages + state_values
-
-        assert not td_deltas.requires_grad
-        assert not advantages.requires_grad
-        assert advantages.shape == (len(batch["states"]), 1)
-        assert v_targets.shape == (len(batch["states"]), 1)
-
-        # TODO: Change this to use a standardiser transform.
-        advantages -= advantages.mean()
-        advantages /= advantages.std() + 1e-8
-
-        return advantages, v_targets
 
     # @torch.no_grad()
     def choose_action(self, state):
@@ -242,95 +182,128 @@ class A2C:
 
         return action
 
-    def get_log_probs_and_entropies(self, states, actions):
+    def generate_rollout(self):
+        experience = self.collect_rollout()
+        rollout_batch = self.process_rollout(experience)
+        return rollout_batch
 
-        log_probs = self.policy.get_log_prob(states, actions).unsqueeze(-1)
-        entropies = self.policy.get_entropy(states).unsqueeze(-1)
+    def collect_rollout(self):
 
-        assert log_probs.requires_grad
-        assert entropies.requires_grad
+        batch_components_shape = (self.n_interactions, self.num_workers)
 
-        assert log_probs.shape == (len(states), 1)
-        assert entropies.shape == (len(states), 1)
+        # Do this in the train function
+        states_batch = torch.zeros(
+            batch_components_shape + self.envs.single_observation_space.shape,
+            dtype=torch.float,
+        ).to(self.device)
+        actions_batch = torch.zeros(
+            batch_components_shape + self.envs.single_action_space.shape,
+            dtype=torch.float,
+        ).to(self.device)
+        rewards_batch = torch.zeros(batch_components_shape).to(self.device)
+        dones_batch = torch.zeros(batch_components_shape).to(self.device)
+        next_states_batch = torch.zeros(
+            batch_components_shape + self.envs.single_observation_space.shape
+        ).to(self.device)
 
-        return log_probs, entropies
+        # Put this into the rollout function
+        states = deepcopy(self.envs.observations)
 
-    def train_one_epoch(self, render_eval=False):
-        batch = self.parallel_gen_experience()
-        advantages, v_targets = self.compute_gae_and_v_targets(batch)
-        batch["advantages"], batch["v_targets"] = advantages, v_targets
+        for step in range(self.n_interactions):
 
-        policy_loss, policy_loss_std = self.update_policy(batch)
-        critic_loss, critic_loss_std = self.update_critic(batch)
+            actions = self.choose_action(states)
+            next_states, rewards, dones, _ = self.envs.step(actions)
 
-        eval_log = self.run_eval(
-            self.num_eval_episodes, step_lim=self.step_lim, render=render_eval
-        )
-        return (policy_loss, policy_loss_std, critic_loss, critic_loss_std), eval_log
+            states_batch[step] = to_torch(states, self.device)
+            actions_batch[step] = to_torch(actions, self.device)
+            rewards_batch[step] = to_torch(rewards, self.device)
+            dones_batch[step] = to_torch(dones, self.device)
+            next_states_batch[step] = to_torch(next_states, self.device)
 
-    def parallel_gen_experience(self):
-        args = list(enumerate(self.envs))
-        out_dict = [{} for _ in range(self.num_workers)]
-        with mp.Pool(self.num_workers) as pool:
-            out = pool.starmap(self.generate_experience, args)
-
-        self.current_epoch += 1
-        for (id, transitions, env) in out:
-            out_dict[id]["transitions"] = transitions
-            out_dict[id]["env"] = env
-        return out_dict
-
-    def generate_experience(self, id, env):
-        """Interact with environment to produce rollout over multiple episodes if necessary.
-
-        Simulates agents interaction with gym env, stores as tuple (s, a, lp, r, d, ns)
-
-
-        Args:
-            render (bool, optional): Whether or not to visualise the interaction. Defaults to False.
-
-        Returns:
-            episodic_rewards (list): scalar rewards for each episode that the agent completes.
-        """
-        # if id != None:
-        #     torch.seed(id)
-        #     np.random.seed(id)
-        #     gym.seed(id)
-
-        state = env.state
-
-        step_counter = 0
-        batch_reward = 0.0
-
-        transitions = [None for _ in range(self.batch_size)]
-
-        while step_counter < self.batch_size:
-
-            action = self.choose_action(state)
-            next_state, reward, done, _ = env.step(action)
-
-            # self.buffer.store((state, action, reward, done, next_state))
-            transitions[step_counter] = (state, action, reward, done, next_state)
-
-            batch_reward += reward
-            step_counter += 1
-            # wandb.log(
-            #     {"train_action": action},
-            #     step=step_counter,
-            # )
-            # Storage
-
-            if done:
-                state = env.reset()
-                # log train_episode_length
-            else:
-                state = next_state
+            states = next_states
 
         return (
-            id,
-            transitions,
-            env,
+            states_batch,
+            actions_batch,
+            rewards_batch,
+            dones_batch,
+            next_states_batch,
         )
+
+    def process_rollout(self, rollout):
+        batches = [None for _ in range(self.num_workers)]
+        (
+            states_batch,
+            actions_batch,
+            rewards_batch,
+            dones_batch,
+            next_states_batch,
+        ) = rollout
+
+        for j in range(self.num_workers):
+            batch = {}
+            batch["states"] = states_batch[:, j]
+            batch["actions"] = actions_batch[:, j]
+            batch["rewards"] = rewards_batch[:, j]
+            batch["dones"] = dones_batch[:, j]
+            batch["next_states"] = next_states_batch[:, j]
+            batch["advantages"], batch["v_targets"] = compute_gae_and_v_targets(
+                self.critic, batch, self.device, self.gamma, self.lam
+            )
+
+            batches[j] = batch
+
+            # batch_reward = torch.reduce_sum(batch["rewards"])
+            # batch_log = {"rewards_sum": batch_reward}
+
+        concat_batch = {
+            k: torch.concat([b[k] for b in batches]) for k in batches[0].keys()
+        }
+
+        with torch.no_grad():
+            concat_batch["old_log_probs"] = self.old_policy.get_log_prob(
+                concat_batch["states"], concat_batch["actions"]
+            )
+
+        return concat_batch
+
+    def update_from_batch(self, batch):
+        total_policy_loss = 0.0
+        total_critic_loss = 0.0
+        log_dict = {}
+        for _ in range(self.num_train_passes):
+            minibatches = minibatch_split(batch, self.minibatch_size)
+            for minibatch in minibatches:
+
+                if self.norm_adv:
+                    minibatch["advantages"], adv_info = normalise_adv(
+                        minibatch["advantages"]
+                    )
+
+                    log_dict["advantages_info"] = adv_info
+
+                policy_loss = self.update_policy(minibatch)
+                critic_loss = self.update_critic(minibatch)
+
+                total_policy_loss += policy_loss[0]
+                total_critic_loss += critic_loss[0]
+
+        mean_policy_loss = total_policy_loss / self.num_train_passes / len(minibatches)
+        mean_critic_loss = total_critic_loss / self.num_train_passes / len(minibatches)
+
+        return mean_policy_loss, mean_critic_loss
+
+    def run_training(self, num_epochs, verbose=True):
+        eval_log = [[] for _ in range(num_epochs)]
+        for e in range(num_epochs):
+            self.current_epoch += 1
+            batch = self.generate_rollout()
+            p_loss, c_loss = self.update_from_batch(batch)
+            eval_r = np.mean(self.run_eval())
+            eval_log[e] = (eval_r, p_loss, c_loss)
+            if verbose:
+                print(eval_log)
+        return eval_log
 
 
 if __name__ == "__main__":
@@ -383,7 +356,7 @@ if __name__ == "__main__":
         "critic_criterion": nn.MSELoss(),
         "device": "cpu",
         "entropy_coef": 0.01,
-        "batch_size": 300,
+        "n_interactions": 300,
         "num_train_passes": 1,
         "lam": 0.95,
         "num_eval_episodes": 15,
@@ -391,8 +364,7 @@ if __name__ == "__main__":
     }
 
     agent = A2C(a2c_args)
-    experience = agent.parallel_gen_experience()
-    print(experience[""])
+    batch = agent.generate_rollout()
 
     # wandb.init(project="deeprl", name="a2c-cartpole", entity="akshil")
     # wandb.config = {

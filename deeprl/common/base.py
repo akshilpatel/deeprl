@@ -1,10 +1,14 @@
 import torch
 from torch import nn
-from typing import List
+from typing import List, Tuple
 from abc import ABC
 from torch.distributions import Categorical, Normal, MultivariateNormal
 import numpy as np
-from deeprl.common.utils import get_gym_space_shape, net_gym_space_dims
+from deeprl.common.utils import (
+    get_gym_space_shape,
+    net_gym_space_dims,
+    orthogoal_layer_init,
+)
 import torch.nn.functional as F
 
 # TODO: Add squeezing for log_probs and entropies and make that work for code base
@@ -18,19 +22,41 @@ class Network(nn.Module):
         # Define each layer according to arch.
         for i in range(len(design)):
             layer_type, params = design[i]
-            self.layers.append(layer_type(**params))
+            layer = layer_type(**params)
+
+            # if i == len(design) - 1:
+            #     layer = orthogoal_layer_init(layer, *output_init)
+            # else:
+            #     layer
+
+            self.layers.append(layer)
 
         self.net = nn.Sequential(*self.layers)
 
     def forward(self, x):
-        assert type(x) == torch.Tensor
-        assert x.dim() > 1
-        assert x.dtype in [float, torch.float32, torch.float64]
         out = self.net(x)
         return out
 
 
+class MLP(nn.Module):
+    def __init__(
+        self,
+        input_dim,
+        output_dim,
+        hidden_dims,
+        hidden_activation,
+        output_activation,
+        hidden_init,
+        output_init,
+    ):
+        pass
+
+
 class Policy(Network):
+    def __init__(self, *args):
+        super().__init__(*args)
+        # self.apply(orthogoal_layer_init)
+
     def get_action(self, state):
         prob_dist = self.forward(state)
         action = prob_dist.sample()
@@ -40,14 +66,23 @@ class Policy(Network):
     def get_log_prob(self, states, actions):
         prob_dist = self.forward(states)
         log_prob = prob_dist.log_prob(actions)
+        log_prob = log_prob.unsqueeze(-1)
 
         return log_prob
 
     def get_entropy(self, states):
         prob_dist = self.forward(states)
         entropy = prob_dist.entropy()
+        entropy = entropy.unsqueeze(-1)
 
         return entropy
+
+    def get_log_probs_and_entropies(self, states, actions):
+
+        log_probs = self.get_log_prob(states, actions)
+        entropies = self.get_entropy(states)
+
+        return log_probs, entropies
 
 
 # TODO: change this to take a network as argument and call the net to get params,
@@ -64,19 +99,6 @@ class CategoricalPolicy(Policy):
 
         prob_dist = Categorical(logits=params)  # use logits if unnormalised,
         return prob_dist
-
-    def sample(self, state, action=None):
-        params = super().forward(state)  # gives unnormalised logits
-
-        prob_dist = Categorical(logits=params)  # use logits if unnormalised,
-
-        if action is None:
-            action = prob_dist.sample()
-
-        log_prob = prob_dist.log_prob(action)
-        entropy = prob_dist.entropy()
-
-        return action, log_prob, entropy
 
 
 class GaussianPolicy(Policy):
@@ -110,27 +132,21 @@ class GaussianPolicy(Policy):
         return mu, cov
 
     # TODO: fix this so it works with MultiNormalz
-    def sample(self, state, action=None):
+    def get_action(self, state):
         params = self.forward(state)
 
         # turn into covariance matrix
         prob_dist = Normal(*params)
 
-        if action is None:
-            action = (
-                prob_dist.rsample()
-            )  # rsample to make sure gradient flows through dist
+        action = prob_dist.rsample()  # rsample to make sure gradient flows through dist
 
-            action = action * self.action_scale.expand_as(
-                action
-            ) + self.action_mid.expand_as(action)
-            # Same as clamp but with vector max and min - used to make sure action is within action_space
-            action = torch.max(torch.min(action, self.action_high), self.action_low)
+        action = action * self.action_scale.expand_as(
+            action
+        ) + self.action_mid.expand_as(action)
+        # Same as clamp but with vector max and min - used to make sure action is within action_space
+        action = torch.max(torch.min(action, self.action_high), self.action_low)
 
-        log_prob = prob_dist.log_prob(action)
-        entropy = prob_dist.entropy()
-
-        return action, log_prob, entropy
+        return action
 
 
 class MultiGaussianPolicy(GaussianPolicy):
@@ -145,24 +161,15 @@ class MultiGaussianPolicy(GaussianPolicy):
         # turn into covariance matrix
         prob_dist = MultivariateNormal(mu, cov)
 
-        if action is None:
-            action = (
-                prob_dist.rsample()
-            )  # rsample to make sure gradient flows through dist
+        action = prob_dist.rsample()  # rsample to make sure gradient flows through dist
 
-            action = action * self.action_scale.expand_as(
-                action
-            ) + self.action_mid.expand_as(action)
-            # Same as clamp but with vector max and min - used to make sure action is within action_space
-            action = torch.max(torch.min(action, self.action_high), self.action_low)
+        action = action * self.action_scale.expand_as(
+            action
+        ) + self.action_mid.expand_as(action)
+        # Same as clamp but with vector max and min - used to make sure action is within action_space
+        action = torch.max(torch.min(action, self.action_high), self.action_low)
 
-        else:
-            action = action.expand_as(cov)
-
-        log_prob = prob_dist.log_prob(action)
-        entropy = prob_dist.entropy()
-
-        return action, log_prob, entropy
+        return action
 
 
 class DeterministicPolicy(GaussianPolicy):
