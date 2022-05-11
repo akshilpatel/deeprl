@@ -35,21 +35,22 @@ class PPO(A2C):
         self.gamma = params["gamma"]
         self.lam = params["lam"]
         self.gamma_lam = self.gamma * self.lam
+        self.norm_adv = params["norm_adv"]
 
         # Environment parameters
-        self.parallel = params["parallel"]
+        self.multiprocess = params["multiprocess"]
         self.num_workers = params["num_workers"]
         self.env_name = params["env_name"]
-        self.envs = init_envs(self.env_name, self.num_workers, self.parallel)
+        self.envs = init_envs(self.env_name, self.num_workers, self.multiprocess)
 
         self.state_dim = get_gym_space_shape(self.envs.single_observation_space)
         self.action_dim = get_gym_space_shape(self.envs.single_action_space)
 
         # Training loop hyperparameters
-        self.num_interaction_steps = params["num_interaction_steps"]
+        self.n_interactions = params["n_interactions"]
         self.minibatch_size = params["minibatch_size"]
         self.num_train_passes = params["num_train_passes"]
-        self.grad_clip_coeff = params["grad_clip_coef"]
+        self.grad_clip_coef = params["grad_clip_coef"]
         assert (
             self.num_workers * self.n_interactions
         ) % self.minibatch_size == 0, "Minibatch_size does not divide batch_size"
@@ -63,7 +64,7 @@ class PPO(A2C):
         self.critic_criterion = params["critic_criterion"]
 
         # Policy
-        self.loss_clip_coeff = params["clip_coeff"]
+        self.loss_clip_coef = params["loss_clip_coef"]
         self.entropy_coef = params["entropy_coef"]
         self.policy = params["policy"].to(self.device)
         self.policy_lr = params["policy_lr"]
@@ -71,8 +72,45 @@ class PPO(A2C):
             self.policy.parameters(), self.policy_lr
         )
 
+        self.current_epoch = 0
+
     def update_policy(self, minibatch):
-        pass
+        advantages = minibatch["advantages"]
+        states = minibatch["states"]
+        actions = minibatch["actions"]
+        old_log_probs = minibatch["old_log_probs"]
+
+        new_log_probs, entropies = self.policy.get_log_probs_and_entropies(
+            states, actions
+        )
+
+        ratio = torch.exp(new_log_probs - old_log_probs)
+        assert ratio.shape == (len(states), 1)
+        assert ratio.shape == advantages.shape
+
+        surr_left = ratio * advantages
+
+        surr_right = advantages * torch.clamp(
+            ratio, 1 - self.loss_clip_coef, 1 + self.loss_clip_coef
+        )
+
+        assert surr_left.shape == ratio.shape
+        assert surr_right.shape == ratio.shape
+
+        policy_loss = -torch.min(surr_left, surr_right) - (
+            entropies * self.entropy_coef
+        )
+
+        policy_loss_std = policy_loss.detach().cpu().std()
+
+        policy_loss = policy_loss.mean()
+
+        self.policy_optimiser.zero_grad()
+        policy_loss.backward()
+        nn.utils.clip_grad_norm_(self.policy.parameters(), self.grad_clip_coef)
+        self.policy_optimiser.step()
+
+        return policy_loss.item(), policy_loss_std.item()
 
     def get_log_probs(self, batch):
         return self.policy.get_log_prob(batch["states"], batch["actions"])

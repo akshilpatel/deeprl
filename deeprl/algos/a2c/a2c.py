@@ -59,6 +59,7 @@ class A2C:
 
         self.num_train_passes = args["num_train_passes"]
         self.norm_adv = args["norm_adv"]
+        self.grad_clip_coef = args["grad_clip_coef"]
 
         self.entropy_coef = args["entropy_coef"]
         self.num_eval_episodes = args["num_eval_episodes"]
@@ -139,7 +140,7 @@ class A2C:
 
         self.critic_optimiser.zero_grad()
         critic_loss.backward()
-        nn.utils.clip_grad_norm_(self.critic.parameters(), 0.5)
+        nn.utils.clip_grad_norm_(self.critic.parameters(), self.grad_clip_coef)
         self.critic_optimiser.step()
         return critic_loss.item(), critic_loss_std.item()
 
@@ -157,7 +158,7 @@ class A2C:
 
         self.policy_optimiser.zero_grad()
         policy_loss.backward()
-        nn.utils.clip_grad_norm_(self.policy.parameters(), 0.5)
+        nn.utils.clip_grad_norm_(self.policy.parameters(), self.grad_clip_coef)
         self.policy_optimiser.step()
 
         return policy_loss.item(), policy_loss_std.item()
@@ -261,7 +262,7 @@ class A2C:
         }
 
         with torch.no_grad():
-            concat_batch["old_log_probs"] = self.old_policy.get_log_prob(
+            concat_batch["old_log_probs"] = self.policy.get_log_prob(
                 concat_batch["states"], concat_batch["actions"]
             )
 
@@ -302,7 +303,7 @@ class A2C:
             eval_r = np.mean(self.run_eval())
             eval_log[e] = (eval_r, p_loss, c_loss)
             if verbose:
-                print(eval_log)
+                print(eval_log[e])
         return eval_log
 
 

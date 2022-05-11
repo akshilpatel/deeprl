@@ -144,7 +144,7 @@ def compute_gae_and_v_targets(
     return advantages, v_targets
 
 
-def normalise_adv(advantage: torch.Tensor):
+def normalise_adv(advantages: torch.Tensor):
     if len(advantages) == 1:
         return advantages
 
