@@ -18,8 +18,7 @@ from deeprl.common.utils import (
     normalise_adv,
     init_envs,
 )
-from deeprl.common.base import Network
-from deeprl.common.base import CategoricalPolicy, GaussianPolicy
+from deeprl.common.base import Network, Critic, CategoricalPolicy, GaussianPolicy
 
 
 class A2C:
@@ -302,8 +301,8 @@ class A2C:
             p_loss, c_loss = self.update_from_batch(batch)
             eval_r = np.mean(self.run_eval())
             eval_log[e] = (eval_r, p_loss, c_loss)
-            if verbose:
-                print(eval_log[e])
+            if verbose and e % 10:
+                print("The log for epoch {} is {}".format(e, eval_log[e]))
         return eval_log
 
 
@@ -351,7 +350,7 @@ if __name__ == "__main__":
         "policy": CategoricalPolicy(policy_layers),
         "policy_optimiser": optim.Adam,
         "policy_lr": 0.002,
-        "critic": Network(critic_layers),
+        "critic": Critic(critic_layers),
         "critic_lr": 0.002,
         "critic_optimiser": optim.Adam,
         "critic_criterion": nn.MSELoss(),

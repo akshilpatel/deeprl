@@ -135,19 +135,3 @@ class OnPolicyMemory(Memory):
         }
 
         return batch
-
-    @staticmethod
-    def batch_to_minibatches(batch, num_minibatches):
-
-        batch_size = len(batch["states"])
-        assert batch // num_minibatches == 0
-        mb_size = batch_size // num_minibatches
-        mb_starts = np.arange(0, batch_size, mb_size)
-
-        indices = np.arange(batch_size)
-        np.random.shuffle(indices)
-
-        mb_idc = [indices[i : i + mb_size] for i in mb_starts]
-
-        # TODO: convert batches to minibatches using indices (look at slm-lab)
-        pass

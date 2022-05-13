@@ -220,8 +220,8 @@ def minibatch_split(batch, mb_size, shuffle=True):
     return minibatches
 
 
-def orthogoal_layer_init(layer, weight_std=np.sqrt(2), bias_const=0.0):
-    if isinstance(layer, nn.Linear):
+def layer_init(layer, weight_std=np.sqrt(2), bias_const=0.0):
+    if isinstance(layer, nn.Linear) or isinstance(layer, nn.Conv2d):
         torch.nn.init.orthogonal_(layer.weight, weight_std)
         torch.nn.init.constant_(layer.bias, bias_const)
     return layer
