@@ -25,6 +25,8 @@ from deeprl.algos.a2c.a2c import A2C
 from deeprl.common.base import CategoricalPolicy, GaussianPolicy
 
 torch.utils.backcompat.broadcast_warning.enabled = True
+from torch.utils.tensorboard import SummaryWriter
+import wandb
 
 
 class PPO(A2C):

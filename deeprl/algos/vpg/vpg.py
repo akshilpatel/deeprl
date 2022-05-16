@@ -33,8 +33,7 @@ class VPG:
         self.policy = CategoricalPolicy(params["policy_layers"]).to(self.device)
         self.optimiser = params["policy_optimiser"](self.policy.parameters(), self.lr)
         self.entropy_coef = params["entropy_coef"]
-        self.step_lim = params["step_lim"
-    
+        self.step_lim = params["step_lim"]
 
     def choose_action(self, state):  # return a numpy action
         """
@@ -52,7 +51,7 @@ class VPG:
         #     state
         # )  # tensors of shape [1, action_dim]
 
-        action = self.policy.get_action(state) # changed
+        action = self.policy.get_action(state)  # changed
         # Convert back to numpy array for gym and use squeeze to deal with discrete actions
         action = action.cpu().squeeze().detach().numpy()
 

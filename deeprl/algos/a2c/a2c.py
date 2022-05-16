@@ -19,6 +19,8 @@ from deeprl.common.utils import (
     init_envs,
 )
 from deeprl.common.base import Network, Critic, CategoricalPolicy, GaussianPolicy
+from torch.utils.tensorboard import SummaryWriter
+import wandb
 
 
 class A2C:
@@ -64,6 +66,7 @@ class A2C:
         self.num_eval_episodes = args["num_eval_episodes"]
         self.multiprocess = args["multiprocess"]
         self.current_epoch = 0
+        self.training_interaction_step = 0
 
         self.envs = init_envs(self.env_name, self.num_workers, self.multiprocess)
 
@@ -100,7 +103,8 @@ class A2C:
             state = next_state
 
         env.close()
-        return episodic_reward
+        info = {"eval_epi_len": step_counter, "eval_epi_reward": episodic_reward}
+        return episodic_reward, info
 
     def run_eval(self, num_episodes: int = 10, step_lim=np.inf, render: bool = False):
         """This is a wrapper method around the `run_episode` method to run several episodes in evaluation.
@@ -118,13 +122,26 @@ class A2C:
         # with mp.Pool(self.num_workers) as pool:
         #     epi_rewards = pool.map(self.run_eval_episode, (step_lim, render))
 
-        epi_rewards = [
-            self.run_eval_episode(step_lim, render) for _ in range(num_episodes)
-        ]
+        epi_rewards, epi_lengths = list(
+            zip(*[self.run_eval_episode(step_lim, render) for _ in range(num_episodes)])
+        )
+
+        eval_log = {
+            "epoch": self.current_epoch,
+            "evaluation/mean_epi_reward": np.mean(epi_rewards),
+            "evaluation/std_epi_reward": np.std(epi_rewards),
+            "evaluation/max_epi_reward": max(epi_rewards),
+            "evaluation/min_epi_reward": min(epi_rewards),
+            "evaluation/mean_epi_length": np.mean(epi_lengths),
+            "evaluation/std_epi_length": np.std(epi_lengths),
+            "evaluation/max_epi_length": max(epi_lengths),
+            "evaluation/min_epi_length": min(epi_lengths),
+        }
+        wandb.log(eval_log)
 
         self.policy.train()
         self.critic.train()
-        return epi_rewards
+        return np.mean(epi_rewards)
 
     def update_critic(self, minibatch):
         states = minibatch["states"]
@@ -152,15 +169,13 @@ class A2C:
         log_probs, entropies = self.policy.get_log_probs_and_entropies(states, actions)
 
         policy_loss = -advantages * log_probs - entropies * self.entropy_coef
-        policy_loss_std = policy_loss.detach().std()
-        policy_loss = policy_loss.mean()
 
         self.policy_optimiser.zero_grad()
         policy_loss.backward()
         nn.utils.clip_grad_norm_(self.policy.parameters(), self.grad_clip_coef)
         self.policy_optimiser.step()
 
-        return policy_loss.item(), policy_loss_std.item()
+        return policy_loss.mean().item(), entropies.mean().item()
 
     # @torch.no_grad()
     def choose_action(self, state):
@@ -221,6 +236,7 @@ class A2C:
             next_states_batch[step] = to_torch(next_states, self.device)
 
             states = next_states
+            self.training_interaction_step += self.num_workers
 
         return (
             states_batch,
@@ -253,9 +269,6 @@ class A2C:
 
             batches[j] = batch
 
-            # batch_reward = torch.reduce_sum(batch["rewards"])
-            # batch_log = {"rewards_sum": batch_reward}
-
         concat_batch = {
             k: torch.concat([b[k] for b in batches]) for k in batches[0].keys()
         }
@@ -265,44 +278,77 @@ class A2C:
                 concat_batch["states"], concat_batch["actions"]
             )
 
+        self.compute_batch_stats(concat_batch)
+
         return concat_batch
 
     def update_from_batch(self, batch):
         total_policy_loss = 0.0
         total_critic_loss = 0.0
-        log_dict = {}
+        total_entropies = 0.0
+
         for _ in range(self.num_train_passes):
             minibatches = minibatch_split(batch, self.minibatch_size)
             for minibatch in minibatches:
 
                 if self.norm_adv:
-                    minibatch["advantages"], adv_info = normalise_adv(
-                        minibatch["advantages"]
-                    )
+                    minibatch["advantages"], _ = normalise_adv(minibatch["advantages"])
 
-                    log_dict["advantages_info"] = adv_info
-
-                policy_loss = self.update_policy(minibatch)
+                policy_loss, entropy = self.update_policy(minibatch)
                 critic_loss = self.update_critic(minibatch)
 
-                total_policy_loss += policy_loss[0]
-                total_critic_loss += critic_loss[0]
+                total_policy_loss += policy_loss
+                total_critic_loss += critic_loss
+                total_entropies += entropy
 
-        mean_policy_loss = total_policy_loss / self.num_train_passes / len(minibatches)
-        mean_critic_loss = total_critic_loss / self.num_train_passes / len(minibatches)
+        mean_policy_loss = total_policy_loss / self.num_train_passes
+        mean_critic_loss = total_critic_loss / self.num_train_passes
+        mean_entropy = total_entropies / self.num_train_passes
+
+        wandb.log(
+            {
+                "epoch": self.current_epoch,
+                "mean_policy_loss": mean_policy_loss,
+                "mean_critic_loss": mean_critic_loss,
+                "mean_entropy": mean_entropy,
+            }
+        )
 
         return mean_policy_loss, mean_critic_loss
 
+    def compute_batch_stats(self, batch):
+        out = {
+            "epoch": self.current_epoch,
+            "rollout/max_advantage": batch["advantages"].max(),
+            "rollout/min_advantage": batch["advantages"].min(),
+            "rollout/std_advantage": batch["advantages"].std(),
+            "rollout/mean_advantage": batch["advantages"].mean(),
+            "rollout/max_reward": batch["rewards"].max(),
+            "rollout/min_reward": batch["rewards"].min(),
+            "rollout/std_reward": batch["rewards"].std(),
+            "rollout/mean_reward": batch["rewards"].mean(),
+            "rollout/max_return": batch["v_targets"].max(),
+            "rollout/min_return": batch["v_targets"].min(),
+            "rollout/std_return": batch["v_targets"].std(),
+            "rollout/mean_return": batch["v_targets"].mean(),
+        }
+
+        wandb.log(out)
+
+        return out
+
     def run_training(self, num_epochs, verbose=True):
-        eval_log = [[] for _ in range(num_epochs)]
+        eval_log = [() for _ in range(num_epochs)]
         for e in range(num_epochs):
             self.current_epoch += 1
             batch = self.generate_rollout()
             p_loss, c_loss = self.update_from_batch(batch)
-            eval_r = np.mean(self.run_eval())
-            eval_log[e] = (eval_r, p_loss, c_loss)
-            if verbose and e % 10:
+            eval_output = self.run_eval()
+
+            eval_log[e] = (eval_output, p_loss, c_loss)
+            if verbose and e % 10 == 0:
                 print("The log for epoch {} is {}".format(e, eval_log[e]))
+
         return eval_log
 
 
