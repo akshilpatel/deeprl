@@ -177,7 +177,7 @@ class A2C:
 
         return policy_loss.mean().item(), entropies.mean().item()
 
-    # @torch.no_grad()
+    @torch.no_grad()
     def choose_action(self, state):
         """Calls the policy network to sample an action for a given state. The log_prob of the action and the entropy of the distribution are also recorded for updates.
 
@@ -278,7 +278,7 @@ class A2C:
                 concat_batch["states"], concat_batch["actions"]
             )
 
-        self.compute_batch_stats(concat_batch)
+        self.log_batch_stats(concat_batch)
 
         return concat_batch
 
@@ -301,9 +301,9 @@ class A2C:
                 total_critic_loss += critic_loss
                 total_entropies += entropy
 
-        mean_policy_loss = total_policy_loss / self.num_train_passes
-        mean_critic_loss = total_critic_loss / self.num_train_passes
-        mean_entropy = total_entropies / self.num_train_passes
+        mean_policy_loss = total_policy_loss / self.num_train_passes / len(minibatches)
+        mean_critic_loss = total_critic_loss / self.num_train_passes / len(minibatches)
+        mean_entropy = total_entropies / self.num_train_passes / len(minibatches)
 
         wandb.log(
             {
@@ -316,7 +316,7 @@ class A2C:
 
         return mean_policy_loss, mean_critic_loss
 
-    def compute_batch_stats(self, batch):
+    def log_batch_stats(self, batch):
         out = {
             "epoch": self.current_epoch,
             "rollout/max_advantage": batch["advantages"].max(),
@@ -337,15 +337,16 @@ class A2C:
 
         return out
 
-    def run_training(self, num_epochs, verbose=True):
+    def run_training(self, num_epochs: int, verbose=True):
+        """This is the main function needed to run."""
         eval_log = [() for _ in range(num_epochs)]
         for e in range(num_epochs):
             self.current_epoch += 1
             batch = self.generate_rollout()
-            p_loss, c_loss = self.update_from_batch(batch)
+            losses = self.update_from_batch(batch)
             eval_output = self.run_eval()
 
-            eval_log[e] = (eval_output, p_loss, c_loss)
+            eval_log[e] = (eval_output, losses)
             if verbose and e % 10 == 0:
                 print("The log for epoch {} is {}".format(e, eval_log[e]))
 
