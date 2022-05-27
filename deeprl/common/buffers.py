@@ -84,54 +84,85 @@ class Memory:
         return self.batch
 
 
-class ParallelMemory(Memory):
-    def __init__(self, max_len, device, num_workers=1):
-        self.max_len = max_len
-        self.num_workers = num_workers
-        self.buffers = [deque(maxlen=self.max_len) for i in range(self.num_workers)]
+class OnPolicyMemory:
+    def __init__(self, n_interactions, device, state_dim, action_dim, num_workers=1):
+        self.n_workers = num_workers
         self.device = device
         self.keys = ["states", "actions", "rewards", "dones", "next_states"]
+        self.n_interactions = n_interactions
+        self.state_dim = state_dim
+        self.action_dim = action_dim
 
-    def store(self, transition):
-        if self.num_workers == 1:
-            self.buffers[0].append(transition)
+    def reset_batch(self):
+        batch_component_shape = self.n_interactions, self.num_workers
+        # Do this in the train function
+        self.states_buff = torch.zeros((*batch_component_shape, *self.state_dim), dtype=torch.float).to(self.device)
 
-        else:
-            for i, buffer in enumerate(self.buffers):
-                self.buffers.append(transition[i])
-        return self.buffer
+        self.actions_buff = torch.zeros((*batch_component_shape, *self.action_dim), dtype=torch.float).to(self.device)
+        
+        self.e_rewards_buff = torch.zeros(batch_component_shape).to(self.device)
+        # self.i_rewards_buff = torch.zeros(batch_component_shape).to(self.device)
+        self.dones_buff = torch.zeros(batch_component_shape).to(self.device)
+        self.next_states_buff = torch.zeros((*batch_component_shape, *self.state_dim)).to(self.device)
 
-    def __len__(self):
-        return len(self.buffers[0])
+        return True
 
+    def extract_batch_components(self):
+        batches = [None for _ in range(self.num_workers)]
 
-class OnPolicyMemory(Memory):
-    """Version of memory where order matters."""
+        for j in range(self.num_workers):
+            batch = {}
+            batch["states"] = self.states_buff[:, j]
+            batch["actions"] = self.actions_buff[:, j]
+            batch["rewards"] = self.rewards_buff[:, j]
+            batch["dones"] = self.dones_buff[:, j]
+            batch["next_states"] = self.next_states_buff[:, j]
+            
+            batches[j] = batch
+        
+        return batches
 
-    def __init__(self, max_len, device):
-        super().__init__(max_len, device)
-        self.num_workers = num_workers
+    def sample(self):
+        batches = self.extract_batch_components
+    
+    def store(self, transition, curr_step):
+        states, actions, rewards, dones, next_states = transition
 
-    def sample_batch(self):
-        """Convert buffer to ordered stacks of different components instead of rows of transitions and convert these to float tensors.
+        self.states_buff[curr_step] = to_torch(states, self.device)
+        self.actions_buff[curr_step] = to_torch(actions, self.device)
+        self.e_rewards_buff[curr_step] = to_torch(rewards, self.device)
+        # self.i_rewards_buff[curr_step] = to_torch(i_rewards, self.device)
+        self.dones_buff[curr_step] = to_torch(dones, self.device)
+        self.next_states_buff[curr_step] = to_torch(next_states, self.device)
 
-        Returns:
-            batch (dict[key: list(data)): Batch of experiences where keys correspond to each component recorded at a time step.
-        """
-        # separate lists for each part of transition
-        states, actions, rewards, dones, next_states = [
-            to_torch(data, self.device) for data in zip(*self.buffer)
-        ]
+        return True
 
-        # TODO: Make this generalise to storing anything - maybe with an *args and map(torch.tensor.float().to)
-        # Conversion to tensor is here instead of during storage to take advantage of vectorisation for a big batch
+        # Abstract to AC class
+    def process_rollout(self):
+        batches = [None for _ in range(self.num_workers)]
 
-        batch = {
-            "states": states,
-            "actions": actions,
-            "rewards": rewards,
-            "dones": dones,
-            "next_states": next_states,
+        for j in range(self.num_workers):
+            batch = {}
+            batch["states"] = self.states_buff[:, j]
+            batch["actions"] = self.actions_buff[:, j]
+            batch["e_rewards"] = self.e_rewards_buff[:, j]
+            # batch["i_rewards"] = self.i_rewards_buff[:, j]
+            batch["dones"] = self.dones_buff[:, j]
+            batch["next_states"] = self.next_states_buff[:, j]
+            batch["advantages"], batch["v_targets"] = compute_gae_and_v_targets(
+                self.critic, batch, self.device, self.gamma, self.lam
+            )
+
+            batches[j] = batch
+
+        concat_batch = {
+            k: torch.concat([b[k] for b in batches]) for k in batches[0].keys()
         }
 
-        return batch
+        with torch.no_grad():
+            concat_batch["old_log_probs"] = self.policy.get_log_prob(
+                concat_batch["states"], concat_batch["actions"]
+            )
+
+        return concat_batch
+

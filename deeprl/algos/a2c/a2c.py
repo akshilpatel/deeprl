@@ -8,68 +8,66 @@ import torch.multiprocessing as mp
 
 from typing import List, Tuple, Dict
 
-
 from deeprl.common.utils import (
     net_gym_space_dims,
-    discount_cumsum,
     compute_gae_and_v_targets,
     to_torch,
     minibatch_split,
     normalise_adv,
     init_envs,
+    concat_parallel_batches
 )
 from deeprl.common.base import Network, Critic, CategoricalPolicy, GaussianPolicy
-from torch.utils.tensorboard import SummaryWriter
 import wandb
 
 
 class A2C:
-    def __init__(self, args):
-        self.device = args["device"]
+    def __init__(self, params):
+        self.device = params["device"]
 
-        self.gamma = args["gamma"]
-        self.lam = args["lam"]
+        # RL hyperparams
+        self.gamma = params["gamma"]
+        self.lam = params["lam"]
         self.gamma_lam = self.gamma * self.lam
+        self.norm_adv = params["norm_adv"]
 
-        self.env_name = args["env_name"]
-        self.step_lim = args["step_lim"]
-        self.num_workers = args["num_workers"]
+        # Environment parameters
+        self.multiprocess = params["multiprocess"]
+        self.num_workers = params["num_workers"]
+        self.env_name = params["env_name"]
+        self.envs = init_envs(self.env_name, self.num_workers, self.multiprocess)
 
-        # Critic
-        self.critic = args["critic"].to(self.device)
-        self.critic_lr = args["critic_lr"]
-        self.critic_optimiser = args["critic_optimiser"](
-            self.critic.parameters(), self.critic_lr
-        )
-        self.critic_criterion = args["critic_criterion"]
-
-        # Policy
-        self.policy = args["policy"].to(self.device)
-        self.policy_lr = args["policy_lr"]
-        self.policy_optimiser = args["policy_optimiser"](
-            self.policy.parameters(), self.policy_lr
-        )
-        self.entropy_coef = args["entropy_coef"]
-
-        self.n_interactions = args["n_interactions"]
-        self.minibatch_size = args["minibatch_size"]
-
+        # Training loop hyperparameters
+        self.n_interactions = params["n_interactions"]
+        self.minibatch_size = params["minibatch_size"]
+        self.num_train_passes = params["num_train_passes"]
+        self.grad_clip_coef = params["grad_clip_coef"]
         assert (
             self.num_workers * self.n_interactions
         ) % self.minibatch_size == 0, "Minibatch_size does not divide batch_size"
 
-        self.num_train_passes = args["num_train_passes"]
-        self.norm_adv = args["norm_adv"]
-        self.grad_clip_coef = args["grad_clip_coef"]
+        # Critic
+        self.critic = params["critic"].to(self.device)
+        self.critic_lr = params["critic_lr"]
+        self.critic_optimiser = params["critic_optimiser"](
+            self.critic.parameters(), self.critic_lr
+        )
+        self.critic_criterion = params["critic_criterion"]
 
-        self.entropy_coef = args["entropy_coef"]
-        self.num_eval_episodes = args["num_eval_episodes"]
-        self.multiprocess = args["multiprocess"]
+        # Policy
+        self.entropy_coef = params["entropy_coef"]
+        self.policy = params["policy"].to(self.device)
+        self.policy_lr = params["policy_lr"]
+        self.policy_optimiser = params["policy_optimiser"](
+            self.policy.parameters(), self.policy_lr
+        )
+
         self.current_epoch = 0
         self.training_interaction_step = 0
 
         self.envs = init_envs(self.env_name, self.num_workers, self.multiprocess)
 
+    # Abstract into Agent class
     def run_eval_episode(self, step_lim=np.inf, render=False):
         """Functionality for running an episode with updating.
 
@@ -85,10 +83,10 @@ class A2C:
 
         episodic_reward = 0.0
         step_counter = 0
+
         while step_counter < step_lim:
 
             action = self.choose_action(np.expand_dims(state, 0))
-
             next_state, reward, done, _ = env.step(action)
 
             episodic_reward += reward
@@ -96,16 +94,16 @@ class A2C:
 
             if render:
                 env.render()
-
             if done:
                 break
 
             state = next_state
 
         env.close()
-        info = {"eval_epi_len": step_counter, "eval_epi_reward": episodic_reward}
-        return episodic_reward, info
+        # info = {"eval_epi_len": step_counter, "eval_epi_reward": episodic_reward}
+        return episodic_reward, step_counter
 
+    # Abstract into Agent class
     def run_eval(self, num_episodes: int = 10, step_lim=np.inf, render: bool = False):
         """This is a wrapper method around the `run_episode` method to run several episodes in evaluation.
 
@@ -126,22 +124,23 @@ class A2C:
             zip(*[self.run_eval_episode(step_lim, render) for _ in range(num_episodes)])
         )
 
-        eval_log = {
-            "epoch": self.current_epoch,
-            "evaluation/mean_epi_reward": np.mean(epi_rewards),
-            "evaluation/std_epi_reward": np.std(epi_rewards),
-            "evaluation/max_epi_reward": max(epi_rewards),
-            "evaluation/min_epi_reward": min(epi_rewards),
-            "evaluation/mean_epi_length": np.mean(epi_lengths),
-            "evaluation/std_epi_length": np.std(epi_lengths),
-            "evaluation/max_epi_length": max(epi_lengths),
-            "evaluation/min_epi_length": min(epi_lengths),
+        eval_stats = {
+            "eval/mean_epi_reward": np.mean(epi_rewards),
+            "eval/std_epi_reward": np.std(epi_rewards),
+            "eval/max_epi_reward": max(epi_rewards),
+            "eval/min_epi_reward": min(epi_rewards),
+            "eval/mean_epi_length": np.mean(epi_lengths),
+            "eval/std_epi_length": np.std(epi_lengths),
+            "eval/max_epi_length": max(epi_lengths),
+            "eval/min_epi_length": min(epi_lengths),
+            "eval/num_interactions": sum(epi_lengths),
         }
-        wandb.log(eval_log)
+        # Add intrinsic rewards and metrics to log here?
 
         self.policy.train()
         self.critic.train()
-        return np.mean(epi_rewards)
+
+        return eval_stats
 
     def update_critic(self, minibatch):
         states = minibatch["states"]
@@ -152,14 +151,15 @@ class A2C:
         v_preds = self.critic(states)
 
         critic_loss = self.critic_criterion(v_preds, v_targets)
-        critic_loss_std = critic_loss.detach().std()  # For logging
 
         self.critic_optimiser.zero_grad()
         critic_loss.backward()
         nn.utils.clip_grad_norm_(self.critic.parameters(), self.grad_clip_coef)
         self.critic_optimiser.step()
-        return critic_loss.item(), critic_loss_std.item()
 
+        return critic_loss.item()
+
+    # A2C
     def update_policy(self, minibatch):
 
         advantages = minibatch["advantages"]
@@ -169,14 +169,16 @@ class A2C:
         log_probs, entropies = self.policy.get_log_probs_and_entropies(states, actions)
 
         policy_loss = -advantages * log_probs - entropies * self.entropy_coef
+        policy_loss = policy_loss.mean()
 
         self.policy_optimiser.zero_grad()
         policy_loss.backward()
         nn.utils.clip_grad_norm_(self.policy.parameters(), self.grad_clip_coef)
         self.policy_optimiser.step()
 
-        return policy_loss.mean().item(), entropies.mean().item()
+        return policy_loss.item(), entropies.mean().item()
 
+    # Abstract into Agent class.
     @torch.no_grad()
     def choose_action(self, state):
         """Calls the policy network to sample an action for a given state. The log_prob of the action and the entropy of the distribution are also recorded for updates.
@@ -197,29 +199,28 @@ class A2C:
 
         return action
 
-    def generate_rollout(self):
-        experience = self.collect_rollout()
-        rollout_batch = self.process_rollout(experience)
-        return rollout_batch
+    # Abstract to agent class
+    def generate_batch(self):
+        rollout = self.collect_rollout()
+        batches = self.extract_batches(rollout)
+        batches = self.process_batches(batches)
+        out_batch = concat_parallel_batches(batches)
 
+        return out_batch
+
+    # Abstract to agent class
     def collect_rollout(self):
 
         batch_components_shape = (self.n_interactions, self.num_workers)
+        state_dim = self.envs.single_observation_space.shape
+        action_dim = self.envs.single_action_space.shape
 
-        # Do this in the train function
-        states_batch = torch.zeros(
-            batch_components_shape + self.envs.single_observation_space.shape,
-            dtype=torch.float,
-        ).to(self.device)
-        actions_batch = torch.zeros(
-            batch_components_shape + self.envs.single_action_space.shape,
-            dtype=torch.float,
-        ).to(self.device)
+        # Buffer
+        states_batch = torch.zeros((*batch_components_shape, *state_dim), dtype=torch.float).to(self.device)
+        actions_batch = torch.zeros((*batch_components_shape, *action_dim), dtype=torch.float).to(self.device)
         rewards_batch = torch.zeros(batch_components_shape).to(self.device)
         dones_batch = torch.zeros(batch_components_shape).to(self.device)
-        next_states_batch = torch.zeros(
-            batch_components_shape + self.envs.single_observation_space.shape
-        ).to(self.device)
+        next_states_batch = torch.zeros((*batch_components_shape, *state_dim), dtype=torch.float).to(self.device)
 
         # Put this into the rollout function
         states = deepcopy(self.envs.observations)
@@ -229,6 +230,9 @@ class A2C:
             actions = self.choose_action(states)
             next_states, rewards, dones, _ = self.envs.step(actions)
 
+            # self.buffer.store((states, actions, rewards, dones, next_states))
+
+            # buffer
             states_batch[step] = to_torch(states, self.device)
             actions_batch[step] = to_torch(actions, self.device)
             rewards_batch[step] = to_torch(rewards, self.device)
@@ -245,16 +249,13 @@ class A2C:
             dones_batch,
             next_states_batch,
         )
-
-    def process_rollout(self, rollout):
+   
+        
+    # Buffer
+    def extract_batches(self, rollout):
         batches = [None for _ in range(self.num_workers)]
-        (
-            states_batch,
-            actions_batch,
-            rewards_batch,
-            dones_batch,
-            next_states_batch,
-        ) = rollout
+        states_batch, actions_batch, rewards_batch, dones_batch, next_states_batch = rollout
+        
 
         for j in range(self.num_workers):
             batch = {}
@@ -263,25 +264,36 @@ class A2C:
             batch["rewards"] = rewards_batch[:, j]
             batch["dones"] = dones_batch[:, j]
             batch["next_states"] = next_states_batch[:, j]
-            batch["advantages"], batch["v_targets"] = compute_gae_and_v_targets(
-                self.critic, batch, self.device, self.gamma, self.lam
-            )
-
+            
             batches[j] = batch
+        
+        return batches
 
-        concat_batch = {
-            k: torch.concat([b[k] for b in batches]) for k in batches[0].keys()
-        }
+    # A2C
+    def process_batches(self, batches):
+        """
+        Compute targets etc., for use in updating the agent.
+        Args:
+            batches (list(dict)): list of dictionary batches where each dictionary corresponds to one worker's experience.
+        
+        Returns:
+            out_batches: The same list of dictionary batches with (key, values) added for everything needed in the update function.
+        """
+        out_batches = [None for _ in range(self.num_workers)]
 
-        with torch.no_grad():
-            concat_batch["old_log_probs"] = self.policy.get_log_prob(
-                concat_batch["states"], concat_batch["actions"]
-            )
-
-        self.log_batch_stats(concat_batch)
-
-        return concat_batch
-
+        for i, batch in enumerate(batches): 
+            adv, v_targets = compute_gae_and_v_targets(self.critic, batch, self.device, self.gamma, self.lam)
+            batch["advantages"], batch["v_targets"] = adv, v_targets
+            
+            # Used for logging if not for updating.
+            with torch.no_grad():
+                batch["old_log_probs"] = self.policy.get_log_prob(
+                    batch["states"], batch["actions"]
+                )
+            out_batches[i] = batch
+        return out_batches
+    
+    # Abstract to ActorCritic class
     def update_from_batch(self, batch):
         total_policy_loss = 0.0
         total_critic_loss = 0.0
@@ -305,50 +317,76 @@ class A2C:
         mean_critic_loss = total_critic_loss / self.num_train_passes / len(minibatches)
         mean_entropy = total_entropies / self.num_train_passes / len(minibatches)
 
-        wandb.log(
-            {
-                "epoch": self.current_epoch,
-                "mean_policy_loss": mean_policy_loss,
-                "mean_critic_loss": mean_critic_loss,
-                "mean_entropy": mean_entropy,
-            }
-        )
+        with torch.no_grad():
+            approx_kl_vec = self.compute_approx_kl(batch)
+            
 
-        return mean_policy_loss, mean_critic_loss
-
-    def log_batch_stats(self, batch):
-        out = {
-            "epoch": self.current_epoch,
-            "rollout/max_advantage": batch["advantages"].max(),
-            "rollout/min_advantage": batch["advantages"].min(),
-            "rollout/std_advantage": batch["advantages"].std(),
-            "rollout/mean_advantage": batch["advantages"].mean(),
-            "rollout/max_reward": batch["rewards"].max(),
-            "rollout/min_reward": batch["rewards"].min(),
-            "rollout/std_reward": batch["rewards"].std(),
-            "rollout/mean_reward": batch["rewards"].mean(),
-            "rollout/max_return": batch["v_targets"].max(),
-            "rollout/min_return": batch["v_targets"].min(),
-            "rollout/std_return": batch["v_targets"].std(),
-            "rollout/mean_return": batch["v_targets"].mean(),
+        training_stats = {
+            "train/mean_policy_loss": mean_policy_loss,
+            "train/mean_critic_loss": mean_critic_loss,
+            "train/mean_entropy": mean_entropy,
+            "train/mean_kl_div": approx_kl_vec.mean().item(),
         }
 
-        wandb.log(out)
+        return training_stats
 
-        return out
+    
+    def compute_approx_kl(self, batch):
+        assert "old_log_probs" in batch.keys()
 
-    def run_training(self, num_epochs: int, verbose=True):
-        """This is the main function needed to run."""
+        new_log_probs = self.policy.get_log_prob(batch["states"], batch["actions"])
+        log_ratio = new_log_probs - batch["old_log_probs"]
+        # See http://joschu.net/blog/kl-approx.html
+        approx_kl = log_ratio.exp() - 1 - log_ratio
+        
+        return approx_kl
+
+
+    def compute_batch_stats(self, batch):
+        batch_stats = {
+            "rollout/max_advantage": batch["advantages"].max().item(),
+            "rollout/min_advantage": batch["advantages"].min().item(),
+            "rollout/std_advantage": batch["advantages"].std().item(),
+            "rollout/mean_advantage": batch["advantages"].mean().item(),
+            "rollout/max_reward": batch["rewards"].max().item(),
+            "rollout/min_reward": batch["rewards"].min().item(),
+            "rollout/std_reward": batch["rewards"].std().item(),
+            "rollout/mean_reward": batch["rewards"].mean().item(),
+            "rollout/max_return": batch["v_targets"].max().item(),
+            "rollout/min_return": batch["v_targets"].min().item(),
+            "rollout/std_return": batch["v_targets"].std().item(),
+            "rollout/mean_return": batch["v_targets"].mean().item(),
+        }
+        return batch_stats
+
+    def run_training(self, num_epochs: int, is_logging: bool = True):
+        """This is the main interface for runnning experiments."""
         eval_log = [() for _ in range(num_epochs)]
         for e in range(num_epochs):
             self.current_epoch += 1
-            batch = self.generate_rollout()
-            losses = self.update_from_batch(batch)
-            eval_output = self.run_eval()
+            batch = self.generate_batch()
 
-            eval_log[e] = (eval_output, losses)
-            if verbose and e % 10 == 0:
-                print("The log for epoch {} is {}".format(e, eval_log[e]))
+            if is_logging:
+                batch_stats = self.compute_batch_stats(batch)
+
+            training_stats = self.update_from_batch(batch)
+            eval_stats = self.run_eval()
+
+            eval_log[e] = eval_stats
+
+            epoch_stats = {
+                "epoch": self.current_epoch,
+                "rollout/interaction_steps": self.training_interaction_step,
+            }
+
+            if is_logging:
+                wandb.log(
+                    {**epoch_stats, **batch_stats, **training_stats, **eval_stats}
+                )
+
+            # This is used for debugging only.
+            elif e % 5 == 0:
+                print("Epoch {}: ".format(e), eval_stats)
 
         return eval_log
 
@@ -357,13 +395,13 @@ if __name__ == "__main__":
 
     env_name = "CartPole-v1"
 
-    env = gym.make(env_name)
+    cp_env = gym.make(env_name)
 
-    policy_layers = [
+    cp_policy_layers = [
         (
             nn.Linear,
             {
-                "in_features": net_gym_space_dims(env.observation_space),
+                "in_features": net_gym_space_dims(cp_env.observation_space),
                 "out_features": 32,
             },
         ),
@@ -372,15 +410,18 @@ if __name__ == "__main__":
         (nn.Tanh, {}),
         (
             nn.Linear,
-            {"in_features": 32, "out_features": net_gym_space_dims(env.action_space)},
+            {
+                "in_features": 32,
+                "out_features": net_gym_space_dims(cp_env.action_space),
+            },
         ),
     ]
 
-    critic_layers = [
+    cp_critic_layers = [
         (
             nn.Linear,
             {
-                "in_features": net_gym_space_dims(env.observation_space),
+                "in_features": net_gym_space_dims(cp_env.observation_space),
                 "out_features": 32,
             },
         ),
@@ -390,64 +431,101 @@ if __name__ == "__main__":
         (nn.Linear, {"in_features": 32, "out_features": 1}),
     ]
 
-    a2c_args = {
+    cartpole_a2c_args = {
         "gamma": 0.99,
-        "env_name": env_name,
-        "step_lim": 200,
-        "policy": CategoricalPolicy(policy_layers),
+        "env_name": "CartPole-v1",
+        "step_lim": 500,
+        "policy": CategoricalPolicy(cp_policy_layers),
         "policy_optimiser": optim.Adam,
         "policy_lr": 0.002,
-        "critic": Critic(critic_layers),
+        "critic": Critic(cp_critic_layers),
         "critic_lr": 0.002,
         "critic_optimiser": optim.Adam,
         "critic_criterion": nn.MSELoss(),
         "device": "cpu",
         "entropy_coef": 0.01,
         "n_interactions": 300,
+        "num_train_passes": 4,
+        "lam": 0.95,
+        "num_eval_episodes": 15,
+        "num_workers": 6,
+        "minibatch_size": 300,
+        "norm_adv": True,
+        "multiprocess": False,
+        "grad_clip_coef": 0.5,
+    }
+
+    ll_env = gym.make("LunarLander-v2")
+
+    ll_policy_layers = [
+        (
+            nn.Linear,
+            {
+                "in_features": net_gym_space_dims(ll_env.observation_space),
+                "out_features": 128,
+            },
+        ),
+        (nn.ReLU, {}),
+        (nn.Linear, {"in_features": 128, "out_features": 64}),
+        (nn.ReLU, {}),
+        (
+            nn.Linear,
+            {
+                "in_features": 64,
+                "out_features": net_gym_space_dims(ll_env.action_space),
+            },
+        ),
+    ]
+
+    ll_critic_layers = [
+        (
+            nn.Linear,
+            {
+                "in_features": net_gym_space_dims(ll_env.observation_space),
+                "out_features": 128,
+            },
+        ),
+        (nn.ReLU, {}),
+        (nn.Linear, {"in_features": 128, "out_features": 64}),
+        (nn.ReLU, {}),
+        (nn.Linear, {"in_features": 64, "out_features": 1}),
+    ]
+
+    lunar_lander_a2c_args = {
+        "gamma": 0.99,
+        "env_name": env_name,
+        "step_lim": 500,
+        "policy": CategoricalPolicy(ll_policy_layers),
+        "policy_optimiser": optim.Adam,
+        "policy_lr": 0.0005,
+        "critic": Critic(ll_critic_layers),
+        "critic_lr": 0.0005,
+        "critic_optimiser": optim.Adam,
+        "critic_criterion": nn.MSELoss(),
+        "device": "cpu",
+        "entropy_coef": 0.01,
+        "n_interactions": 128,
         "num_train_passes": 1,
         "lam": 0.95,
         "num_eval_episodes": 15,
-        "num_workers": mp.cpu_count() - 1,
+        "num_workers": 8,
+        "minibatch_size": 256,
+        "norm_adv": True,
+        "multiprocess": False,
+        "grad_clip_coef": 0.5,
     }
+    cp_env.close()
+    ll_env.close()
 
-    agent = A2C(a2c_args)
-    batch = agent.generate_rollout()
+    wandb.init(project="deeprl", name="a2c-cartpole-testing", entity="akshil")
 
-    # wandb.init(project="deeprl", name="a2c-cartpole", entity="akshil")
-    # wandb.config = {
-    #     "environment": env_name,
-    #     "policy_layers": policy_layers,
-    #     "critic_layers": critic_layers,
-    #     "gamma": a2c_args["gamma"],
-    #     "entropy_coef": a2c_args["entropy_coef"],
-    #     "step_lim": a2c_args["step_lim"],
-    #     "policy_lr": a2c_args["policy_lr"],
-    #     "critic_lr": a2c_args["critic_lr"],
-    #     "num_agents": num_agents,
-    #     "num_episodes": num_epi,
-    # }
-    # num_agents = 5
-    # num_epi = 200
-    # r = []
-    # for i in range(2):
-    #     print("Running training for agent number {}".format(i))
-    #     agent = A2C(a2c_args)
+    conf = cartpole_a2c_args
+    conf["num_epochs"] = 10
+    wandb.config = conf
 
-    #     # random.seed(i)
-    #     # np.random.seed(i)
-    #     # torch.manual_seed(i)
-    #     # env.seed(i)
+    agent = A2C(cartpole_a2c_args)
+    wandb.watch(agent.policy)
+    wandb.watch(agent.critic)
+    agent.run_training(conf["num_epochs"])
 
-    #     r.append(agent.train(num_epi))
-
-    # out = np.array(r).mean(0)
-
-    # plt.figure(figsize=(5, 3))
-    # plt.title("A2C on cartpole")
-    # plt.xlabel("Episode")
-    # plt.ylabel("Episodic Reward")
-    # plt.plot(out, label="rewards")
-    # plt.legend()
-
-    # # plt.savefig('./data/a2c_cartpole.PNG')
-    # plt.show()
+    wandb.finish()

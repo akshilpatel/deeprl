@@ -118,7 +118,6 @@ class GaussianPolicy(Policy):
         assert mu.shape == (len(x), self.action_dim), mu.shape
         # assert cov.shape == (len(x), self.action_dim), cov.shape
         assert torch.all(cov >= 0)
-        params = self.forward(state)
 
         # turn into covariance matrix
         prob_dist = Normal(mu, cov)
@@ -126,7 +125,7 @@ class GaussianPolicy(Policy):
 
     # TODO: fix this so it works with MultiNormalz
     def get_action(self, state):
-
+        prob_dist = self.forward(state)
         action = prob_dist.rsample()  # rsample to make sure gradient flows through dist
 
         action = action * self.action_scale.expand_as(

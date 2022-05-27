@@ -67,8 +67,9 @@ def to_torch(x, device):
     return out
 
 
+# TODO: Move unpacking and packing of batches to here from parallel batches.
 @torch.no_grad()
-def compute_td_deltas(critic, batch, gamma):
+def compute_td_deltas(critic, batch, gamma, num_workers=1):
     """Given a batch of trajectories, compute the TD_Error for each state: r_{t} + gamma * V(s_{t+1}) - V(s_{t})
 
     Args:
@@ -79,14 +80,16 @@ def compute_td_deltas(critic, batch, gamma):
     Returns:
         torch.Tensor: Shape: (batch_size, 1) of TD_error values
     """
-
+    
     states = batch["states"]
     next_states = batch["next_states"]
     rewards = batch["rewards"].unsqueeze(-1)
     dones = batch["dones"].unsqueeze(-1)
 
+   
     first_state = states[0].unsqueeze(0)
-    first_state_value = critic(first_state)  # this state is never terminal
+
+    first_state_value = critic(first_state)
 
     next_values = critic(next_states) * (1 - dones)
     assert dones.shape == next_values.shape
@@ -130,7 +133,7 @@ def compute_gae_and_v_targets(
     advantages = discount_cumsum(td_deltas, batch["dones"], gamma * lam)
     advantages = torch.tensor(advantages).to(device)
 
-    state_values = critic(batch["states"])  # States are all non-terminal.
+    state_values = critic(batch["states"]) 
 
     v_targets = advantages + state_values
 
@@ -225,3 +228,11 @@ def layer_init(layer, weight_std=np.sqrt(2), bias_const=0.0):
         torch.nn.init.orthogonal_(layer.weight, weight_std)
         torch.nn.init.constant_(layer.bias, bias_const)
     return layer
+
+
+def concat_parallel_batches(batches):
+        concat_batch = {
+            k: torch.concat([b[k] for b in batches]) for k in batches[0].keys()
+        }
+
+        return concat_batch
