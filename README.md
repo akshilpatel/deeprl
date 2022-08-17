@@ -1,6 +1,10 @@
 
-# Pytorch practice with deep reinforcement learning algorithms
-
+# Implementation of Deep Reinforcement Learning Algorithms in Pytorch
 ---
 
-Pretty much just the title. This repository is a record of me practicing Pytorch by implementing some of the deep rl algorithms.
+Currently Implemented
+
+- [x] DQN
+- [x] VPG
+- [x] A2C
+- [x] PPO
