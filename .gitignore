@@ -78,6 +78,9 @@ ENV/
 # VS code settings
 .vscode
 
+# Intellij Idea
+.idea
+
 # wandb api key
 *.netrc
 
@@ -85,4 +88,7 @@ ENV/
 wandb/
 
 # wip notebooks
-*working
+working.ipynb
+working_copy.ipynb
+testing.ipynb
+
